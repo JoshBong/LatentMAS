@@ -31,7 +31,13 @@ import torch
 from . import Agent
 from models import ModelWrapper
 from utils import normalize_answer, extract_gsm8k_answer
-from prompts_routed import build_routed_lead, build_routed_worker, build_routed_judger
+from prompts_routed import (
+    build_orchestrator_prompt,
+    build_routed_judger,
+    build_routed_lead,
+    build_routed_worker,
+    parse_briefs,
+)
 from methods.cache_ops import cache_concat, cache_length, cache_suffix, clone_cache
 
 
@@ -56,6 +62,10 @@ class RoutedMASMethod:
         self.top_p = top_p
         self.method_name = "routed_mas"
         self.task = getattr(args, "task", None)
+        # 'orchestrated' = the lead decodes a brief per worker (route out with
+        # text); 'static' = fixed contiguous doc split, generic briefs.
+        self.routing = getattr(args, "routing", "orchestrated")
+        self.orchestrator_max_new_tokens = getattr(args, "orchestrator_max_new_tokens", 256)
 
         # Workers = the non-judger custom agents if supplied, else N generic workers.
         custom = getattr(args, "custom_agents", None)
@@ -87,6 +97,24 @@ class RoutedMASMethod:
         ok = (pred == gold) or (gold in pred) or (pred in gold and len(pred) > 0)
         return pred, bool(ok)
 
+    @staticmethod
+    def _f1(pred: str, gold: str) -> float:
+        """HotpotQA-style token-overlap F1 between the extracted answer and gold."""
+        p = (normalize_answer(pred) or "").split()
+        g = (normalize_answer(gold) or "").split()
+        if not p or not g:
+            return float(p == g)
+        common = 0
+        gg = list(g)
+        for tok in p:
+            if tok in gg:
+                common += 1
+                gg.remove(tok)
+        if common == 0:
+            return 0.0
+        prec, rec = common / len(p), common / len(g)
+        return 2 * prec * rec / (prec + rec)
+
     # ------------------------------------------------------------------- worker
     @torch.no_grad()
     def _run_item(self, item: Dict) -> Dict:
@@ -103,22 +131,37 @@ class RoutedMASMethod:
         )
         base_len = cache_length(S0)
 
+        # -- Phase 1b: orchestrator decodes one brief per worker (route OUT = text) --
+        briefs = None
+        if self.routing == "orchestrated":
+            _, o_ids, o_mask, _ = model.prepare_chat_batch(
+                [build_orchestrator_prompt(question, self.n_workers, context_docs, self.args)],
+                add_generation_prompt=True,
+            )
+            o_gen, _ = model.generate_text_batch(
+                o_ids, o_mask, max_new_tokens=self.orchestrator_max_new_tokens,
+                temperature=self.temperature, top_p=self.top_p, past_key_values=None,
+            )
+            briefs = parse_briefs(o_gen[0], self.n_workers)
+
         # -- Phase 2: fan out; each worker runs from an independent clone of S0 --
         worker_caches = []
         worker_embeds = []
         traces = []
         for w_idx, worker in enumerate(self.workers):
-            brief = build_routed_worker(
-                question, w_idx, self.n_workers, context_docs=context_docs, args=self.args
+            brief_text = briefs[w_idx] if briefs else None
+            worker_msgs = build_routed_worker(
+                question, w_idx, self.n_workers, context_docs=context_docs,
+                brief=brief_text, args=self.args,
             )
-            _, b_ids, b_mask, _ = model.prepare_chat_batch([brief], add_generation_prompt=True)
+            _, b_ids, b_mask, _ = model.prepare_chat_batch([worker_msgs], add_generation_prompt=True)
             S0_w = clone_cache(S0)
             S_w, emb = model.generate_latent_batch_hidden_state(
                 b_ids, b_mask, latent_steps=self.latent_steps, past_key_values=S0_w
             )
             worker_caches.append(S_w)
             worker_embeds.append(emb)
-            traces.append({"name": worker.name, "role": worker.role,
+            traces.append({"name": worker.name, "role": worker.role, "brief": brief_text,
                            "latent_steps": self.latent_steps, "output": ""})
 
         # -- Phase 3: combine -> [S0] ++ each worker's own tokens, then judge ----
@@ -134,6 +177,7 @@ class RoutedMASMethod:
         final_text = gens[0].strip()
 
         pred, ok = self._score(final_text, item.get("gold", ""))
+        f1 = self._f1(pred, item.get("gold", ""))
         traces.append({"name": "Judger", "role": "judger", "output": final_text})
 
         return {
@@ -144,6 +188,9 @@ class RoutedMASMethod:
             "raw_prediction": final_text,
             "agents": traces,
             "correct": ok,
+            "f1": f1,
+            "routing": self.routing,
+            "briefs": briefs,
             "worker_divergence": self._divergence(worker_embeds),
             "n_workers": self.n_workers,
         }

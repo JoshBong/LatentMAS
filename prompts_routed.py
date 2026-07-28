@@ -15,6 +15,7 @@ why routing should be a no-op on single-domain tasks (the control).
 
 from __future__ import annotations
 
+import re
 from typing import List, Optional
 
 
@@ -44,33 +45,89 @@ Read and understand the question. Do not answer yet."""
     return _msgs(LEAD_SYSTEM, user)
 
 
+ORCHESTRATOR_SYSTEM = (
+    "You are the orchestrator. Break a question into focused, non-overlapping "
+    "subtasks, one per worker. Each subtask must be answerable from a different "
+    "part of the evidence so the workers do not duplicate each other."
+)
+
+
+def build_orchestrator_prompt(question: str, n_workers: int,
+                              context_docs: Optional[List[str]] = None, args=None) -> List[dict]:
+    """The lead's decode: read the question, emit one brief per worker (as TEXT).
+
+    This is the 'route out with text' half -- the routing decision is discrete,
+    so it is language. The workers' findings come back as latent state.
+    """
+    titles = ""
+    if context_docs:
+        heads = [d.split(":", 1)[0][:80] for d in context_docs]
+        titles = "\n\nAvailable source topics:\n" + "\n".join(f"- {t}" for t in heads)
+    user = f"""Question: {question}{titles}
+
+Assign one focused subtask to each of {n_workers} workers. Make them cover
+different parts of the question / different sources -- do NOT give overlapping work.
+
+Output EXACTLY {n_workers} lines, no more, in this format:
+Worker 1: <subtask>
+Worker 2: <subtask>
+...
+Worker {n_workers}: <subtask>"""
+    return _msgs(ORCHESTRATOR_SYSTEM, user)
+
+
+def parse_briefs(text: str, n_workers: int) -> List[str]:
+    """Pull 'Worker i: <brief>' lines from the orchestrator's decode.
+
+    Robust to slop: takes the first N matches in order, pads with a generic
+    brief if the model under-produced, truncates if it over-produced.
+    """
+    found: List[str] = []
+    for m in re.finditer(r"(?im)^\s*worker\s*\d+\s*[:\-.)]\s*(.+?)\s*$", text):
+        found.append(m.group(1).strip())
+    briefs = found[:n_workers]
+    while len(briefs) < n_workers:
+        briefs.append(f"Cover the part of the question not addressed by workers 1-{len(briefs)}.")
+    return briefs
+
+
 def build_routed_worker(
     question: str,
     w_idx: int,
     n_workers: int,
     context_docs: Optional[List[str]] = None,
+    brief: Optional[str] = None,
     args=None,
 ) -> List[dict]:
     docs = worker_doc_slice(context_docs, w_idx, n_workers)
     system = (
         f"You are Worker {w_idx + 1} of {n_workers} on a team solving a question. "
-        f"Focus ONLY on your assigned material; other workers cover the rest."
+        f"Focus ONLY on your assigned subtask and material; other workers cover the rest."
+    )
+    # The orchestrator's subtask (text, routed out); falls back to a generic focus.
+    task_line = (
+        f"Your assigned subtask: {brief}"
+        if brief
+        else f"You are worker {w_idx + 1}; cover your share of the question."
     )
     if docs:
         doc_block = "\n\n".join(f"[Document {w_idx + 1}.{j + 1}]\n{d}" for j, d in enumerate(docs))
         user = f"""Question: {question}
 
+{task_line}
+
 Your assigned documents:
 {doc_block}
 
-Extract only the facts from YOUR documents that are relevant to the question.
-Note what your documents do and do not establish. Do not guess beyond them."""
+Extract only the facts from YOUR documents relevant to your subtask. Note what
+they do and do not establish. Do not guess beyond them."""
     else:
         user = f"""Question: {question}
 
-You are one of {n_workers} workers. Reason about the aspect of this question that
-is yours to cover (worker index {w_idx + 1}), and surface what you find. Another
-worker will combine everyone's findings."""
+{task_line}
+
+Reason about your assigned subtask and surface what you find. Another worker will
+combine everyone's findings."""
     return _msgs(system, user)
 
 

@@ -54,6 +54,11 @@ def process_batch(
     batch_start = processed
     for offset, res in enumerate(results):
         preds.append(res)
+        if args.log_file:
+            keep = ("question", "gold", "prediction", "correct", "f1", "routing",
+                    "worker_divergence", "n_workers", "briefs")
+            with open(args.log_file, "a", encoding="utf-8") as lf:
+                lf.write(json.dumps({k: res.get(k) for k in keep}, ensure_ascii=False) + "\n")
         problem_idx = batch_start + offset + 1
         print(f"\n==================== Problem #{problem_idx} ====================")
         print("Question:")
@@ -93,6 +98,10 @@ def main():
     parser.add_argument("--max_samples", type=int, default=100)
     parser.add_argument("--task", choices=["gsm8k", "aime2024", "aime2025", "gpqa", "arc_easy", "arc_challenge", "mbppplus", 'humanevalplus', 'medqa', "hotpotqa", "custom"], default="gsm8k")
     parser.add_argument("--num_workers", type=int, default=3, help="Number of parallel workers for routed_mas fan-out")
+    parser.add_argument("--routing", choices=["orchestrated", "static"], default="orchestrated",
+                        help="routed_mas: 'orchestrated' = lead decodes a brief per worker (text out); 'static' = fixed doc split")
+    parser.add_argument("--log_file", type=str, default=None,
+                        help="Append per-item results as JSONL (prediction/correct/f1/worker_divergence/briefs)")
     parser.add_argument("--prompt", type=str, choices=["sequential", "hierarchical"], default="sequential")
     parser.add_argument("--custom_prompt_file", type=str, default=None, help="Path to custom prompt template(s). Supports baseline, text_mas, and latent_mas. Accepts plain text (baseline) or JSON with role-specific fields.")
     parser.add_argument("--custom_question", type=str, default=None, help="Custom question text when --task custom")
@@ -289,22 +298,27 @@ def main():
     total_time = time.time() - start_time
 
     acc, correct = evaluate(preds)
-    print(
-        json.dumps(
-            {
-                "method": args.method,
-                "model": args.model_name,
-                "split": args.split,
-                "seed": args.seed,
-                "max_samples": args.max_samples,
-                "accuracy": acc,
-                "correct": correct,
-                "total_time_sec": round(total_time,4),
-                "time_per_sample_sec": round(total_time / args.max_samples, 4),
-            },
-            ensure_ascii=False,
-        )
-    )
+    f1s = [p["f1"] for p in preds if p.get("f1") is not None]
+    divs = [p["worker_divergence"] for p in preds if p.get("worker_divergence") is not None]
+    summary = {
+        "method": args.method,
+        "model": args.model_name,
+        "task": args.task,
+        "split": args.split,
+        "seed": args.seed,
+        "max_samples": args.max_samples,
+        "accuracy": acc,
+        "correct": correct,
+        "total_time_sec": round(total_time, 4),
+        "time_per_sample_sec": round(total_time / args.max_samples, 4),
+    }
+    if args.method == "routed_mas":
+        summary["routing"] = args.routing
+    if f1s:
+        summary["mean_f1"] = round(sum(f1s) / len(f1s), 4)
+    if divs:
+        summary["mean_worker_divergence"] = round(sum(divs) / len(divs), 4)
+    print(json.dumps(summary, ensure_ascii=False))
 
 
 

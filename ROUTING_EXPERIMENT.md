@@ -81,29 +81,45 @@ Note the distinction that keeps it ours: Science's "hierarchical" (even if it wo
 
 **Risks:** hinges on a task that genuinely decomposes (the build's center of gravity); static routing may not differentiate workers (diagnostic #2 catches early); it may simply not help — a fine, informative outcome under the triple rule.
 
-## Build status — first cut DONE (branch `routed-mas`, off Science-LatentMAS)
+## Build status — DONE (branch `routed-mas`, off Science-LatentMAS)
+
+The channel design: **route OUT with text** (orchestrator decodes a brief per worker),
+**come BACK with latent state** (workers' KV/hidden state, concatenated for the judge).
+This is the Anthropic orchestrator-worker graph with the *return* channel swapped
+text→latent.
 
 **Shipped:**
-- `methods/cache_ops.py` — `clone_cache` / `cache_length` / `cache_suffix` / `cache_concat` (KV surgery via the legacy round-trip, works on Cache obj or tuple).
-- `methods/routed_mas.py` — `RoutedMASMethod`: lead → clone-per-worker fan-out → suffix+concat → judge, + `worker_divergence` diagnostic, + scoring. Processes one item at a time (bs=1) so the cache surgery is exact (no padding to reconcile) — batching is a later optimization.
-- `prompts_routed.py` — lead / worker / judger prompts; contiguous `worker_doc_slice`.
-- `data.py::load_hotpotqa` — distractor config; yields `context_docs` (for routed) + `question_full` (for non-routed arms so they see the same evidence).
-- `run.py` — `--method routed_mas`, `--task hotpotqa`, `--num_workers`; non-routed arms auto-get `question_full`.
-- `tests/` — `test_cache_ops.py` (3) + `test_routed_smoke.py` (2), **all green on CPU**.
+- `methods/cache_ops.py` — `clone_cache` / `cache_length` / `cache_suffix` / `cache_concat` (KV surgery via the legacy round-trip; Cache obj or tuple).
+- `methods/routed_mas.py` — `RoutedMASMethod`, four phases: (1) lead encodes the question → S0; (1b) **orchestrator decodes one text brief per worker** (`--routing orchestrated`, the default) or falls back to a static contiguous doc split (`--routing static`); (2) each worker clones S0 + gets its brief/slice, runs independently; (3) judge decodes from `concat(S0, each worker's own tokens)`. Plus `worker_divergence`, EM + token-**F1**, and `briefs` logged. bs=1 so the cache surgery is exact.
+- `prompts_routed.py` — orchestrator / lead / worker / judger prompts, `parse_briefs` (robust to model slop), `worker_doc_slice`.
+- `data.py::load_hotpotqa` — distractor; yields `context_docs` (routed) + `question_full` (non-routed arms see the same evidence).
+- `run.py` — `--method routed_mas`, `--task hotpotqa`, `--num_workers`, `--routing`, and **`--log_file`** (per-item JSONL: prediction/correct/f1/worker_divergence/briefs). Summary prints mean_f1 + mean_worker_divergence.
+- `tests/` — cache_ops (3) + routed smoke incl. orchestrated + static (4) + parse_briefs/doc-slice (4) = **10 green on CPU**.
 
-**Verified on CPU (no GPU/download):** the KV handoff identity (split==whole), clone independence, suffix/concat reconstruction, and the full three-phase pipeline wiring incl. the concatenated-cache decode — via a tiny GPT-2 stand-in. This covers the one real bug-risk (cache surgery + phase composition).
+**Verified on CPU (no GPU/download, tiny GPT-2 stand-in):** KV handoff identity (split==whole), clone independence, suffix/concat reconstruction, the full four-phase wiring incl. the orchestrator decode→parse→workers and the concatenated-cache decode, brief parsing, F1. Covers the real bug-risk.
 
-**NOT verified (GPU-only, held):** real accuracy on a Qwen instruct model. `methods/latent_mas.py` pulls in vLLM (needs CUDA), so the CPU venv here can't run the real end-to-end — that's the GPU box.
+**NOT verified (GPU-only, held for you):** real accuracy on Qwen3-4B. `latent_mas` pulls in vLLM (CUDA), so this CPU venv can't run the real end-to-end.
 
-**Run on the box:**
+**Run on the box (Qwen3-4B; keeps their defaults latent_steps=10/temp 0.6):**
 ```bash
-pip install -e . ; pip install vllm      # or the repo's requirements
-# routed vs the chain, fastest signal:
-python run.py --method routed_mas --task hotpotqa --model_name Qwen/Qwen2.5-7B-Instruct \
-  --num_workers 3 --max_samples 100 --seed 42 --do_not_enforce_qwen
-python run.py --method latent_mas --task hotpotqa --model_name Qwen/Qwen2.5-7B-Instruct \
-  --prompt hierarchical --max_samples 100 --seed 42
-```
-Then judge by the triple rule above (Δacc>seed-spread ∧ workers diverged ∧ no effect on GSM8K). First thing to watch: `worker_divergence` in the routed output — if ~0, the briefs aren't differentiating and nothing downstream matters.
+pip install -r requirements.txt        # or: pip install -e . ; pip install vllm
 
-**Known limits of the first cut:** bs=1 (slow, fine for a first read); static routing (contiguous doc split — not lead-generated briefs); free-form EM scoring on HotpotQA (no F1 yet).
+# --- THE TEST: HotpotQA, routed vs the chain, 3 seeds each (no published baseline) ---
+for s in 42 43 44; do
+  python run.py --method routed_mas --task hotpotqa --model_name Qwen/Qwen3-4B \
+    --num_workers 3 --routing orchestrated --max_samples 100 --seed $s \
+    --do_not_enforce_qwen --log_file results/routed_hotpot_$s.jsonl
+  python run.py --method latent_mas --task hotpotqa --model_name Qwen/Qwen3-4B \
+    --prompt hierarchical --max_samples 100 --seed $s \
+    --log_file results/chain_hotpot_$s.jsonl
+done
+
+# --- THE CONTROL: their tasks, reuse their published numbers, run only your arm ---
+python run.py --method routed_mas --task gsm8k --model_name Qwen/Qwen3-4B \
+  --num_workers 3 --max_samples 100 --seed 42 --do_not_enforce_qwen \
+  --log_file results/routed_gsm8k_42.jsonl   # expect ~their number + divergence≈0
+```
+
+**Judge by the triple rule:** routed "wins" only if Δacc(routed−chain) on HotpotQA **> seed spread** AND **mean_worker_divergence is high** (workers actually differentiated) AND **no effect on the GSM8K control**. First number to read is `mean_worker_divergence` — if ≈0, the orchestrator isn't producing distinct briefs and nothing downstream matters. Their benchmarks don't decompose, so they can only show "no harm," never a win.
+
+**Known limits:** bs=1 (slow, fine for a first read); static doc→worker mapping even in orchestrated mode (the lead writes sub-tasks but docs are still split contiguously — matching sub-task↔doc is a later knob); F1 is token-overlap, not the official HotpotQA supporting-fact metric.

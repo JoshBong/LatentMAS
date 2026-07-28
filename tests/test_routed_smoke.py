@@ -61,34 +61,46 @@ class _FakeWrapper:
         out = self.model(input_ids=input_ids, attention_mask=full_mask,
                          past_key_values=past_key_values, position_ids=pos, use_cache=True)
         assert out.logits.shape[1] == input_ids.shape[-1]      # stitched cache accepted
-        return ["reasoning... \\boxed{paris}"], None
+        # One canned decode serves both callers: parse_briefs pulls 3 worker lines
+        # from it (orchestrator), _extract pulls the \boxed answer (judger).
+        return ["Worker 1: find the director\nWorker 2: find their nationality\n"
+                "Worker 3: cross-check\n\\boxed{paris}"], None
 
 
 class _Args:
-    task = "hotpotqa"
-    custom_agents = None
+    def __init__(self, routing="orchestrated"):
+        self.task = "hotpotqa"
+        self.custom_agents = None
+        self.routing = routing
 
 
-def test_routed_pipeline_runs_end_to_end():
+def test_orchestrated_pipeline_runs_end_to_end():
     method = RoutedMASMethod(
         _FakeWrapper(), latent_steps=0, judger_max_new_tokens=4,
-        num_workers=3, args=_Args(),
+        num_workers=3, args=_Args("orchestrated"),
     )
-    item = {
+    res = method.run_item({
         "question": "What nationality was the director of Inception?",
-        "context_docs": [f"Document {i} body text about something." for i in range(6)],
+        "context_docs": [f"Document {i} body text." for i in range(6)],
         "gold": "paris",
-    }
-    res = method.run_item(item)
-
-    # the pipeline completed and produced the expected record shape
+    })
     assert res["n_workers"] == 3
-    assert res["prediction"] == "paris" and res["correct"] is True   # from the stubbed decode
-    assert isinstance(res["worker_divergence"], float)               # 3 workers -> diagnostic computed
+    assert res["routing"] == "orchestrated"
+    assert res["prediction"] == "paris" and res["correct"] is True   # stubbed decode
+    assert isinstance(res["f1"], float)
+    assert res["briefs"] is not None and len(res["briefs"]) == 3     # lead's briefs parsed + kept
+    assert isinstance(res["worker_divergence"], float)
     assert len(res["agents"]) == 4                                   # 3 workers + judger
 
 
+def test_static_routing_has_no_briefs():
+    method = RoutedMASMethod(_FakeWrapper(), latent_steps=0, num_workers=2, args=_Args("static"))
+    res = method.run_item({"question": "q", "context_docs": ["a", "b"], "gold": "z"})
+    assert res["routing"] == "static"
+    assert res["briefs"] is None                                    # static -> no lead decode
+
+
 def test_divergence_none_for_single_worker():
-    method = RoutedMASMethod(_FakeWrapper(), latent_steps=0, num_workers=1, args=_Args())
+    method = RoutedMASMethod(_FakeWrapper(), latent_steps=0, num_workers=1, args=_Args("static"))
     res = method.run_item({"question": "q", "context_docs": ["a", "b"], "gold": "z"})
     assert res["worker_divergence"] is None                         # needs >=2 workers
