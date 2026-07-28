@@ -89,14 +89,14 @@ This is the Anthropic orchestrator-worker graph with the *return* channel swappe
 text→latent.
 
 **Shipped:**
-- `methods/cache_ops.py` — `clone_cache` / `cache_length` / `cache_suffix` / `cache_concat` (KV surgery via the legacy round-trip; Cache obj or tuple).
-- `methods/routed_mas.py` — `RoutedMASMethod`, four phases: (1) lead encodes the question → S0; (1b) **orchestrator decodes one text brief per worker** (`--routing orchestrated`, the default) or falls back to a static contiguous doc split (`--routing static`); (2) each worker clones S0 + gets its brief/slice, runs independently; (3) judge decodes from `concat(S0, each worker's own tokens)`. Plus `worker_divergence`, EM + token-**F1**, and `briefs` logged. bs=1 so the cache surgery is exact.
+- `methods/cache_ops.py` — `clone_cache` / `cache_length` / `cache_suffix` / `cache_concat` + **`cache_reindex`** (KV surgery via the legacy round-trip; Cache obj or tuple).
+- `methods/routed_mas.py` — `RoutedMASMethod`, four phases: (1) lead encodes the question → S0; (1b) **orchestrator decodes one text brief per worker** (`--routing orchestrated`, the default) or falls back to a static contiguous doc split (`--routing static`); (2) each worker clones S0 + gets its brief/slice, runs independently; (3) judge decodes from `concat(S0, each worker's own tokens)`, with each worker's keys **RoPE-reindexed** to its slot so the stitched cache is positionally a clean sequential read (default on; `--no_reindex` to A/B it). Plus `worker_divergence`, EM + token-**F1**, and `briefs` logged. bs=1 so the cache surgery is exact.
 - `prompts_routed.py` — orchestrator / lead / worker / judger prompts, `parse_briefs` (robust to model slop), `worker_doc_slice`.
 - `data.py::load_hotpotqa` — distractor; yields `context_docs` (routed) + `question_full` (non-routed arms see the same evidence).
 - `run.py` — `--method routed_mas`, `--task hotpotqa`, `--num_workers`, `--routing`, and **`--log_file`** (per-item JSONL: prediction/correct/f1/worker_divergence/briefs). Summary prints mean_f1 + mean_worker_divergence.
-- `tests/` — cache_ops (3) + routed smoke incl. orchestrated + static (4) + parse_briefs/doc-slice (4) = **10 green on CPU**.
+- `tests/` — cache_ops (3) + **RoPE reindex ground-truth on tiny-Llama (2)** + routed smoke incl. orchestrated + static (4) + parse_briefs/doc-slice (4) = **12 green on CPU**.
 
-**Verified on CPU (no GPU/download, tiny GPT-2 stand-in):** KV handoff identity (split==whole), clone independence, suffix/concat reconstruction, the full four-phase wiring incl. the orchestrator decode→parse→workers and the concatenated-cache decode, brief parsing, F1. Covers the real bug-risk.
+**Verified on CPU (no GPU/download):** KV handoff identity (split==whole), clone independence, suffix/concat reconstruction, the full four-phase wiring incl. orchestrator decode→parse→workers and the concatenated-cache decode, brief parsing, F1 (all on a tiny GPT-2 stand-in); and — on a real RoPE model (tiny Llama) — that **`cache_reindex(cache_at_p, Δ) == cache_at_(p+Δ)` exactly**, so the position de-entanglement provably works. Covers the real bug-risk.
 
 **NOT verified (GPU-only, held for you):** real accuracy on Qwen3-4B. `latent_mas` pulls in vLLM (CUDA), so this CPU venv can't run the real end-to-end.
 
@@ -121,5 +121,7 @@ python run.py --method routed_mas --task gsm8k --model_name Qwen/Qwen3-4B \
 ```
 
 **Judge by the triple rule:** routed "wins" only if Δacc(routed−chain) on HotpotQA **> seed spread** AND **mean_worker_divergence is high** (workers actually differentiated) AND **no effect on the GSM8K control**. First number to read is `mean_worker_divergence` — if ≈0, the orchestrator isn't producing distinct briefs and nothing downstream matters. Their benchmarks don't decompose, so they can only show "no harm," never a win.
+
+**Worth an A/B once it runs:** `--no_reindex` vs default. The RoPE fix makes the stitched judge cache positionally clean; if it materially helps HotpotQA acc, that's a real ablation for the writeup (and confirms position entanglement was hurting the judge).
 
 **Known limits:** bs=1 (slow, fine for a first read); static doc→worker mapping even in orchestrated mode (the lead writes sub-tasks but docs are still split contiguously — matching sub-task↔doc is a later knob); F1 is token-overlap, not the official HotpotQA supporting-fact metric.

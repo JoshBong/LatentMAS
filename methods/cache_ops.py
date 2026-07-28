@@ -69,6 +69,46 @@ def cache_suffix(cache, start: int):
     return _from_legacy(sliced, cache)
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+
+
+def cache_reindex(cache, delta: int, rope_theta: float = 10000.0):
+    """Shift a cache's KEYS forward by `delta` positions, via RoPE composition.
+
+    A RoPE'd key at position p is R(p)·k0; because rotations compose,
+    R(delta)·R(p)·k0 = R(p+delta)·k0 -- i.e. multiplying the cached (post-RoPE)
+    key by the rotation for `delta` relocates it to position p+delta WITHOUT
+    re-running the model. Values carry no position, so they are left untouched.
+
+    This de-entangles a stitched cache: each worker was encoded starting at the
+    same base position, so its keys carry overlapping rotary phases; shifting
+    worker w by the total length of the workers before it makes the concatenated
+    cache positionally identical to a single sequential read.
+
+    `rope_theta` MUST match the model (Qwen3 uses 1e6, not 1e4). head_dim is read
+    off the cache. Only valid for RoPE models (no-op semantics on learned-pos
+    models -- do not call it there).
+    """
+    if delta == 0:
+        return clone_cache(cache)
+    legacy = _to_legacy(cache)
+    K0 = legacy[0][0]
+    head_dim = K0.shape[-1]
+    inv_freq = 1.0 / (rope_theta ** (
+        torch.arange(0, head_dim, 2, dtype=torch.float32, device=K0.device) / head_dim))
+    ang = float(delta) * inv_freq                      # [head_dim/2]
+    emb = torch.cat([ang, ang], dim=-1)                # [head_dim]
+    cos = emb.cos().to(K0.dtype)
+    sin = emb.sin().to(K0.dtype)
+    out = tuple(
+        ((k * cos) + (_rotate_half(k) * sin), v)       # rotate K, leave V
+        for (k, v) in legacy
+    )
+    return _from_legacy(out, cache)
+
+
 def cache_concat(caches: Sequence):
     """Concatenate several caches along the sequence axis, layer by layer.
 

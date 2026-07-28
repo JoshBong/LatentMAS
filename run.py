@@ -100,6 +100,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=3, help="Number of parallel workers for routed_mas fan-out")
     parser.add_argument("--routing", choices=["orchestrated", "static"], default="orchestrated",
                         help="routed_mas: 'orchestrated' = lead decodes a brief per worker (text out); 'static' = fixed doc split")
+    parser.add_argument("--no_reindex", action="store_true",
+                        help="routed_mas: disable RoPE re-indexing of the stitched judge cache (for A/B on whether it matters)")
     parser.add_argument("--log_file", type=str, default=None,
                         help="Append per-item results as JSONL (prediction/correct/f1/worker_divergence/briefs)")
     parser.add_argument("--prompt", type=str, choices=["sequential", "hierarchical"], default="sequential")
@@ -314,6 +316,7 @@ def main():
     }
     if args.method == "routed_mas":
         summary["routing"] = args.routing
+        summary["reindex"] = not args.no_reindex
     if f1s:
         summary["mean_f1"] = round(sum(f1s) / len(f1s), 4)
     if divs:

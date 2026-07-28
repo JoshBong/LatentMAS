@@ -38,7 +38,7 @@ from prompts_routed import (
     build_routed_worker,
     parse_briefs,
 )
-from methods.cache_ops import cache_concat, cache_length, cache_suffix, clone_cache
+from methods.cache_ops import cache_concat, cache_length, cache_reindex, cache_suffix, clone_cache
 
 
 class RoutedMASMethod:
@@ -66,6 +66,11 @@ class RoutedMASMethod:
         # text); 'static' = fixed contiguous doc split, generic briefs.
         self.routing = getattr(args, "routing", "orchestrated")
         self.orchestrator_max_new_tokens = getattr(args, "orchestrator_max_new_tokens", 256)
+        # De-entangle RoPE positions in the stitched judge cache (default on).
+        self.reindex = not getattr(args, "no_reindex", False)
+        hf = getattr(model, "HF_model", None) or getattr(model, "model", None)
+        cfg = getattr(hf, "config", None)
+        self.rope_theta = float(getattr(cfg, "rope_theta", 10000.0)) if cfg is not None else 10000.0
 
         # Workers = the non-judger custom agents if supplied, else N generic workers.
         custom = getattr(args, "custom_agents", None)
@@ -165,7 +170,18 @@ class RoutedMASMethod:
                            "latent_steps": self.latent_steps, "output": ""})
 
         # -- Phase 3: combine -> [S0] ++ each worker's own tokens, then judge ----
-        combined = cache_concat([S0] + [cache_suffix(S_w, base_len) for S_w in worker_caches])
+        # Each worker was encoded starting at base_len, so their keys carry
+        # overlapping RoPE positions. Shift worker w by the total length of the
+        # workers before it -> the stitched cache is positionally a sequential read.
+        suffixes = []
+        offset = 0
+        for S_w in worker_caches:
+            suf = cache_suffix(S_w, base_len)
+            if self.reindex and offset > 0:
+                suf = cache_reindex(suf, offset, rope_theta=self.rope_theta)
+            suffixes.append(suf)
+            offset += cache_length(suf)
+        combined = cache_concat([S0] + suffixes)
 
         _, j_ids, j_mask, _ = model.prepare_chat_batch(
             [build_routed_judger(question, self.args)], add_generation_prompt=True

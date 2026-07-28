@@ -72,6 +72,7 @@ class _Args:
         self.task = "hotpotqa"
         self.custom_agents = None
         self.routing = routing
+        self.no_reindex = True          # GPT-2 has no RoPE; reindex is tested separately on Llama
 
 
 def test_orchestrated_pipeline_runs_end_to_end():
