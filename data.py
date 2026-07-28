@@ -221,3 +221,31 @@ def load_medqa(split=None, subset=None, cache_dir=None):
             "gold": gold,
         }
 
+
+
+def load_hotpotqa(split: str = "validation", cache_dir: Optional[str] = None) -> Iterable[Dict]:
+    """HotpotQA distractor: a multi-hop question ships with ~10 paragraphs (2 gold
+    + 8 distractors). The answer needs facts spread across paragraphs -- the task
+    genuinely decomposes, which is what a routing experiment needs.
+
+    Yields both `context_docs` (list, for routed workers to split) and
+    `question_full` (question + all docs, for the non-routed comparison arms so
+    they see the same evidence).
+    """
+    ds = load_dataset("hotpot_qa", "distractor", split=split, cache_dir=cache_dir,
+                      trust_remote_code=True)
+    for item in ds:
+        question = item["question"].strip()
+        answer = str(item["answer"]).strip()
+        ctx = item["context"]
+        titles = ctx["title"]
+        sentences = ctx["sentences"]
+        docs = [f"{t}: {' '.join(s)}".strip() for t, s in zip(titles, sentences)]
+        question_full = question + "\n\nContext:\n" + "\n\n".join(docs)
+        yield {
+            "question": question,
+            "context_docs": docs,
+            "question_full": question_full,
+            "solution": answer,
+            "gold": normalize_answer(answer),
+        }

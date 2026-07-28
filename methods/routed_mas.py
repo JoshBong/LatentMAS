@@ -1,0 +1,176 @@
+"""Routed fan-out over the latent (KV) channel.
+
+The contrast with LatentMAS in one sentence: LatentMAS threads ONE growing cache
+through a linear agent chain (every agent sees every predecessor); routed_mas
+gives each worker an INDEPENDENT clone of a shared base cache plus its OWN
+targeted brief, then concatenates their contributions for the judge.
+
+Three phases (methods/cache_ops.py does the surgery):
+
+    1. lead    : encode the shared question once            -> base cache S0
+    2. fan out : for each worker, clone S0, run it from that clone on its brief
+                 (workers never see each other)             -> S_w, embeddings
+    3. combine : judger decodes from  [S0] ++ [each worker's own tokens]
+
+We deliberately process ONE item at a time (batch of 1) in this first cut: it
+keeps the cache surgery exact (no left/right-padding to reconcile across workers).
+Batching is a later optimization, not a correctness requirement.
+
+GPU note: the cache primitives are CPU-tested (tests/test_cache_ops.py); this
+end-to-end method requires a real model (Qwen) and has NOT been run yet.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+from typing import Dict, List, Optional
+
+import torch
+
+from . import Agent
+from models import ModelWrapper
+from utils import normalize_answer, extract_gsm8k_answer
+from prompts_routed import build_routed_lead, build_routed_worker, build_routed_judger
+from methods.cache_ops import cache_concat, cache_length, cache_suffix, clone_cache
+
+
+class RoutedMASMethod:
+    def __init__(
+        self,
+        model: ModelWrapper,
+        *,
+        latent_steps: int = 10,
+        judger_max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        num_workers: int = 3,
+        generate_bs: int = 1,
+        args: argparse.Namespace = None,
+    ) -> None:
+        self.args = args
+        self.model = model
+        self.latent_steps = latent_steps
+        self.judger_max_new_tokens = judger_max_new_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.method_name = "routed_mas"
+        self.task = getattr(args, "task", None)
+
+        # Workers = the non-judger custom agents if supplied, else N generic workers.
+        custom = getattr(args, "custom_agents", None)
+        if custom:
+            self.workers: List[Agent] = [a for a in custom if a.role != "judger"]
+        else:
+            self.workers = [Agent(name=f"Worker{i + 1}", role=f"worker{i + 1}")
+                            for i in range(num_workers)]
+        self.n_workers = len(self.workers)
+
+    # ------------------------------------------------------------------ scoring
+    def _extract(self, text: str) -> str:
+        m = re.search(r"\\boxed\{(.+?)\}", text, flags=re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        if self.task in ("gsm8k", "aime2024", "aime2025"):
+            got = extract_gsm8k_answer(text)
+            if got:
+                return got
+        # free-form (hotpotqa): last non-empty line
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        return lines[-1] if lines else text.strip()
+
+    def _score(self, pred_text: str, gold: str) -> tuple:
+        pred = normalize_answer(self._extract(pred_text)) or ""
+        gold = (gold or "").strip().lower()
+        if not gold:
+            return pred, False
+        ok = (pred == gold) or (gold in pred) or (pred in gold and len(pred) > 0)
+        return pred, bool(ok)
+
+    # ------------------------------------------------------------------- worker
+    @torch.no_grad()
+    def _run_item(self, item: Dict) -> Dict:
+        model = self.model
+        question = item["question"]
+        context_docs: Optional[List[str]] = item.get("context_docs")
+
+        # -- Phase 1: lead encodes the shared question -> base cache S0 ----------
+        _, lead_ids, lead_mask, _ = model.prepare_chat_batch(
+            [build_routed_lead(question, self.args)], add_generation_prompt=True
+        )
+        S0 = model.generate_latent_batch(
+            lead_ids, lead_mask, latent_steps=0, past_key_values=None
+        )
+        base_len = cache_length(S0)
+
+        # -- Phase 2: fan out; each worker runs from an independent clone of S0 --
+        worker_caches = []
+        worker_embeds = []
+        traces = []
+        for w_idx, worker in enumerate(self.workers):
+            brief = build_routed_worker(
+                question, w_idx, self.n_workers, context_docs=context_docs, args=self.args
+            )
+            _, b_ids, b_mask, _ = model.prepare_chat_batch([brief], add_generation_prompt=True)
+            S0_w = clone_cache(S0)
+            S_w, emb = model.generate_latent_batch_hidden_state(
+                b_ids, b_mask, latent_steps=self.latent_steps, past_key_values=S0_w
+            )
+            worker_caches.append(S_w)
+            worker_embeds.append(emb)
+            traces.append({"name": worker.name, "role": worker.role,
+                           "latent_steps": self.latent_steps, "output": ""})
+
+        # -- Phase 3: combine -> [S0] ++ each worker's own tokens, then judge ----
+        combined = cache_concat([S0] + [cache_suffix(S_w, base_len) for S_w in worker_caches])
+
+        _, j_ids, j_mask, _ = model.prepare_chat_batch(
+            [build_routed_judger(question, self.args)], add_generation_prompt=True
+        )
+        gens, _ = model.generate_text_batch(
+            j_ids, j_mask, max_new_tokens=self.judger_max_new_tokens,
+            temperature=self.temperature, top_p=self.top_p, past_key_values=combined,
+        )
+        final_text = gens[0].strip()
+
+        pred, ok = self._score(final_text, item.get("gold", ""))
+        traces.append({"name": "Judger", "role": "judger", "output": final_text})
+
+        return {
+            "question": question,
+            "gold": item.get("gold", ""),
+            "solution": item.get("solution", ""),
+            "prediction": pred,
+            "raw_prediction": final_text,
+            "agents": traces,
+            "correct": ok,
+            "worker_divergence": self._divergence(worker_embeds),
+            "n_workers": self.n_workers,
+        }
+
+    # -------------------------------------------------------------- diagnostic
+    @staticmethod
+    def _divergence(worker_embeds: List[torch.Tensor]) -> Optional[float]:
+        """Mean pairwise (1 - cosine) between workers' latent outputs.
+
+        ~0 => the workers produced near-identical states: routing did not
+        differentiate them, and any flat accuracy is boring, not a finding.
+        Larger => the briefs actually pulled the workers apart. This is the
+        number that turns 'it didn't help' into 'it didn't help *and here is
+        whether routing even happened*'.
+        """
+        if len(worker_embeds) < 2:
+            return None
+        vecs = [e.float().mean(dim=1).flatten() for e in worker_embeds]  # one vector per worker
+        sims = []
+        for i in range(len(vecs)):
+            for j in range(i + 1, len(vecs)):
+                sims.append(torch.cosine_similarity(vecs[i], vecs[j], dim=0).item())
+        return float(1.0 - sum(sims) / len(sims))
+
+    # ------------------------------------------------------------------- batch
+    def run_batch(self, items: List[Dict]) -> List[Dict]:
+        return [self._run_item(item) for item in items]
+
+    def run_item(self, item: Dict) -> Dict:
+        return self._run_item(item)

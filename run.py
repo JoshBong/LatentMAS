@@ -13,10 +13,12 @@ from data import (
     load_gpqa_diamond,
     load_mbppplus,
     load_humanevalplus,
-    load_medqa
+    load_medqa,
+    load_hotpotqa,
 )
 from methods.baseline import BaselineMethod
 from methods.latent_mas import LatentMASMethod
+from methods.routed_mas import RoutedMASMethod
 from methods.text_mas import TextMASMethod
 from models import ModelWrapper
 from utils import auto_device, set_seed
@@ -85,11 +87,12 @@ def main():
     parser = argparse.ArgumentParser()
 
     # core args for experiments
-    parser.add_argument("--method", choices=["baseline", "text_mas", "latent_mas"], required=True)
+    parser.add_argument("--method", choices=["baseline", "text_mas", "latent_mas", "routed_mas"], required=True)
     parser.add_argument("--model_name", type=str, required=True, #choices=["Qwen/Qwen3-4B", "Qwen/Qwen3-4B", "Qwen/Qwen3-14B"]
     )
     parser.add_argument("--max_samples", type=int, default=100)
-    parser.add_argument("--task", choices=["gsm8k", "aime2024", "aime2025", "gpqa", "arc_easy", "arc_challenge", "mbppplus", 'humanevalplus', 'medqa', "custom"], default="gsm8k")
+    parser.add_argument("--task", choices=["gsm8k", "aime2024", "aime2025", "gpqa", "arc_easy", "arc_challenge", "mbppplus", 'humanevalplus', 'medqa', "hotpotqa", "custom"], default="gsm8k")
+    parser.add_argument("--num_workers", type=int, default=3, help="Number of parallel workers for routed_mas fan-out")
     parser.add_argument("--prompt", type=str, choices=["sequential", "hierarchical"], default="sequential")
     parser.add_argument("--custom_prompt_file", type=str, default=None, help="Path to custom prompt template(s). Supports baseline, text_mas, and latent_mas. Accepts plain text (baseline) or JSON with role-specific fields.")
     parser.add_argument("--custom_question", type=str, default=None, help="Custom question text when --task custom")
@@ -184,7 +187,17 @@ def main():
             latent_steps=args.latent_steps,
             judger_max_new_tokens=args.max_new_tokens,
             **common_kwargs,
-            generate_bs=args.generate_bs, 
+            generate_bs=args.generate_bs,
+            args=args,
+        )
+    elif args.method == 'routed_mas':
+        method = RoutedMASMethod(
+            model,
+            latent_steps=args.latent_steps,
+            judger_max_new_tokens=args.max_new_tokens,
+            **common_kwargs,
+            num_workers=args.num_workers,
+            generate_bs=args.generate_bs,
             args=args,
         )
 
@@ -210,6 +223,8 @@ def main():
         dataset_iter = load_humanevalplus(split='test')
     elif args.task == "medqa":
         dataset_iter = load_medqa(split='test')
+    elif args.task == "hotpotqa":
+        dataset_iter = load_hotpotqa(split='validation')
     elif args.task == "custom":
         if args.custom_question is None and args.custom_question_file is None:
             raise ValueError("For --task custom, provide --custom_question or --custom_question_file.")
@@ -240,6 +255,10 @@ def main():
     for item in dataset_iter:
         if processed >= args.max_samples:
             break
+        # Non-routed arms must see the same evidence: fold all HotpotQA docs into
+        # the question. routed_mas instead splits `context_docs` across workers.
+        if args.task == "hotpotqa" and args.method != "routed_mas" and "question_full" in item:
+            item = {**item, "question": item["question_full"]}
         batch.append(item)
         if len(batch) == args.generate_bs or processed + len(batch) == args.max_samples:
             processed, preds = process_batch(
