@@ -50,11 +50,15 @@ class LatentMASMethod:
         if self.latent_only:
             self.sequential_info_only = True
 
-        self.sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=args.max_new_tokens,
-        )
+        # vLLM-only; the non-vLLM (HF/CPU/MPS) path never touches it.
+        try:
+            self.sampling_params = SamplingParams(
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=args.max_new_tokens,
+            )
+        except NameError:
+            self.sampling_params = None
         self.task = args.task
 
     @staticmethod
@@ -240,14 +244,21 @@ class LatentMASMethod:
                 for ids_row, mask_row in zip(final_agent_ids, final_agent_mask):
                     active_ids = ids_row[mask_row.bool()].tolist()
                     final_agent_tokens_batch.append(self.model.tokenizer.convert_ids_to_tokens(active_ids))
-                generated_batch, _ = self.model.generate_text_batch(
-                    final_agent_ids,
-                    final_agent_mask,
-                    max_new_tokens=self.judger_max_new_tokens,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    past_key_values=past_for_decoding,
-                )
+                if batch_size == 1:
+                    # HF path: generate() can't take a non-prefix past (the latent
+                    # cache is not a prefix of the judge prompt). Decode manually.
+                    generated_batch = [self.model.decode_from_cache(
+                        final_agent_ids, past_for_decoding,
+                        max_new_tokens=self.judger_max_new_tokens)]
+                else:
+                    generated_batch, _ = self.model.generate_text_batch(
+                        final_agent_ids,
+                        final_agent_mask,
+                        max_new_tokens=self.judger_max_new_tokens,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        past_key_values=past_for_decoding,
+                    )
                 for idx in range(batch_size):
                     final_text = generated_batch[idx].strip()
                     final_texts[idx] = final_text

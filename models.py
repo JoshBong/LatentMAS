@@ -266,6 +266,57 @@ class ModelWrapper:
             generations.append(text)
         return generations, outputs.past_key_values
 
+    @torch.no_grad()
+    def decode_from_cache(self, input_ids, past_key_values, max_new_tokens: int = 64,
+                          eos_id: Optional[int] = None) -> str:
+        """Greedy-decode `input_ids` on top of a prefilled cache, via manual forwards.
+
+        HF `generate()` assumes past_key_values is a prefix of the ongoing
+        sequence; here the cache is SEPARATE content (the workers' states) that
+        the judge attends to but which is not a literal prefix of the judge
+        prompt -- so generate()'s bookkeeping breaks. This loop makes no such
+        assumption: it just forwards the judge tokens over the given cache, with
+        positions continuing from the cache length. (Same reason LatentMAS
+        bypasses generate() in its latent loop.)
+        """
+        hf = getattr(self, "HF_model", None) or self.model
+        dev = self.device
+        ids = input_ids.to(dev)
+        if eos_id is None:
+            eos_id = self.tokenizer.eos_token_id
+
+        def _plen(p):
+            if p is None:
+                return 0
+            lg = p.to_legacy_cache() if hasattr(p, "to_legacy_cache") else p
+            return lg[0][0].shape[-2]
+
+        past = past_key_values
+        plen = _plen(past)
+        pos = torch.arange(plen, plen + ids.shape[-1], device=dev).unsqueeze(0)
+        attn = torch.ones(1, plen + ids.shape[-1], dtype=torch.long, device=dev)
+        out = hf(input_ids=ids, attention_mask=attn, position_ids=pos,
+                 past_key_values=past, use_cache=True)
+        past = out.past_key_values
+        nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+
+        gen = []
+        for _ in range(max_new_tokens):
+            if eos_id is not None and int(nxt.item()) == eos_id:
+                break
+            gen.append(nxt)
+            plen = _plen(past)
+            pos = torch.tensor([[plen]], device=dev)
+            attn = torch.ones(1, plen + 1, dtype=torch.long, device=dev)
+            out = hf(input_ids=nxt, attention_mask=attn, position_ids=pos,
+                     past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+
+        if not gen:
+            return ""
+        return self.tokenizer.decode(torch.cat(gen, dim=1)[0], skip_special_tokens=True)
+
     def tokenize_text(self, text: str) -> torch.Tensor:
         return self.tokenizer(
             text,
@@ -360,10 +411,14 @@ class ModelWrapper:
     ) -> Tuple:
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
+        # Fall back to the single HF model / device when there is no separate
+        # second HF model (i.e. the plain non-vLLM path, e.g. CPU/MPS).
+        hf = getattr(self, "HF_model", None) or self.model
+        hf_dev = getattr(self, "HF_device", None) or self.device
         if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, device=self.HF_device)
+            attention_mask = torch.ones_like(input_ids, device=hf_dev)
         else:
-            attention_mask = attention_mask.to(self.HF_device)
+            attention_mask = attention_mask.to(hf_dev)
         if past_key_values is not None:
             past_len = _past_length(past_key_values)
             if past_len > 0:
@@ -373,7 +428,7 @@ class ModelWrapper:
                     device=attention_mask.device,
                 )
                 attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
-        outputs = self.HF_model(
+        outputs = hf(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -399,7 +454,7 @@ class ModelWrapper:
                 dtype=torch.long,
                 device=latent_embed.device,
             )
-            outputs = self.HF_model(
+            outputs = hf(
                 inputs_embeds=latent_embed,
                 attention_mask=latent_mask,
                 past_key_values=past,

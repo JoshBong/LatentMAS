@@ -98,7 +98,20 @@ text→latent.
 
 **Verified on CPU (no GPU/download):** KV handoff identity (split==whole), clone independence, suffix/concat reconstruction, the full four-phase wiring incl. orchestrator decode→parse→workers and the concatenated-cache decode, brief parsing, F1 (all on a tiny GPT-2 stand-in); and — on a real RoPE model (tiny Llama) — that **`cache_reindex(cache_at_p, Δ) == cache_at_(p+Δ)` exactly**, so the position de-entanglement provably works. Covers the real bug-risk.
 
-**NOT verified (GPU-only, held for you):** real accuracy on Qwen3-4B. `latent_mas` pulls in vLLM (CUDA), so this CPU venv can't run the real end-to-end.
+**Runs on plain HF (CPU/MPS, no vLLM) — verified end-to-end on a real model.** Ran both `routed_mas` and `latent_mas` on **Qwen2.5-0.5B-Instruct on a Mac (CPU)**, full 4-phase pipeline, judge produced coherent text, no crash. Three real integration bugs (that the fake-wrapper CPU tests could not have caught) were found and fixed by actually running it:
+1. `generate_latent_batch_hidden_state` assumed a separate `HF_model`/`HF_device` (only set in the vLLM/second-model path) → now falls back to the single model/device.
+2. HF `generate()` **can't take a non-prefix past** (the latent cache isn't a prefix of the judge prompt) → added `ModelWrapper.decode_from_cache` (manual greedy decode); both routed and latent judges use it on the bs=1 HF path. *This bug hits the upstream baseline too — as-shipped `latent_mas` can't run on modern transformers without vLLM.*
+3. `SamplingParams` guarded so methods instantiate without vLLM.
+
+**Still GPU-held:** real *accuracy* at Qwen3-4B scale. The 0.5B Mac run proves the machinery; it's too small/slow for real numbers.
+
+**Quick Mac/CPU smoke (proves the loop, answers are junk at 0.5B):**
+```bash
+python run.py --method routed_mas --task custom \
+  --custom_question "..." --model_name Qwen/Qwen2.5-0.5B-Instruct \
+  --num_workers 2 --latent_steps 2 --max_samples 1 --max_new_tokens 48 \
+  --device cpu --do_not_enforce_qwen
+```
 
 **Run on the box (Qwen3-4B; keeps their defaults latent_steps=10/temp 0.6):**
 ```bash

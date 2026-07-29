@@ -53,18 +53,21 @@ class _FakeWrapper:
     @torch.no_grad()
     def generate_text_batch(self, input_ids, attention_mask=None, *, max_new_tokens,
                             temperature=0.7, top_p=0.95, past_key_values=None):
-        # Prove the judger prompt is consumed on top of the CONCATENATED cache at
-        # the right positions (a plain forward; the real wrapper uses generate()).
+        # Orchestrator decode (past=None). Return parseable worker briefs.
+        return ["Worker 1: find the director\nWorker 2: find their nationality\n"
+                "Worker 3: cross-check"], None
+
+    @torch.no_grad()
+    def decode_from_cache(self, input_ids, past_key_values, max_new_tokens=64, eos_id=None):
+        # Judge decode over the CONCATENATED cache -- exercise that a stitched,
+        # RoPE-free cache is consumed at the continuing positions (a plain forward).
         past_len = cache_length(past_key_values) if past_key_values is not None else 0
         pos = torch.arange(past_len, past_len + input_ids.shape[-1], dtype=torch.long).unsqueeze(0)
         full_mask = torch.ones(1, past_len + input_ids.shape[-1], dtype=torch.long)
         out = self.model(input_ids=input_ids, attention_mask=full_mask,
                          past_key_values=past_key_values, position_ids=pos, use_cache=True)
         assert out.logits.shape[1] == input_ids.shape[-1]      # stitched cache accepted
-        # One canned decode serves both callers: parse_briefs pulls 3 worker lines
-        # from it (orchestrator), _extract pulls the \boxed answer (judger).
-        return ["Worker 1: find the director\nWorker 2: find their nationality\n"
-                "Worker 3: cross-check\n\\boxed{paris}"], None
+        return "the answer is \\boxed{paris}"
 
 
 class _Args:

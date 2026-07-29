@@ -186,11 +186,11 @@ class RoutedMASMethod:
         _, j_ids, j_mask, _ = model.prepare_chat_batch(
             [build_routed_judger(question, self.args)], add_generation_prompt=True
         )
-        gens, _ = model.generate_text_batch(
-            j_ids, j_mask, max_new_tokens=self.judger_max_new_tokens,
-            temperature=self.temperature, top_p=self.top_p, past_key_values=combined,
-        )
-        final_text = gens[0].strip()
+        # Manual decode over the stitched cache -- HF generate() can't take a
+        # non-prefix past (see ModelWrapper.decode_from_cache).
+        final_text = model.decode_from_cache(
+            j_ids, combined, max_new_tokens=self.judger_max_new_tokens
+        ).strip()
 
         pred, ok = self._score(final_text, item.get("gold", ""))
         f1 = self._f1(pred, item.get("gold", ""))
