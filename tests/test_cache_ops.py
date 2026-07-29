@@ -12,11 +12,17 @@ breaks, a routed worker starting from a cloned base cache is not what it claims.
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from methods.cache_ops import cache_concat, cache_length, cache_suffix, clone_cache
+from methods.cache_ops import (
+    _to_legacy,
+    cache_concat,
+    cache_length,
+    cache_suffix,
+    clone_cache,
+)
 
 
 def _legacy(cache):
-    return cache.to_legacy_cache() if hasattr(cache, "to_legacy_cache") else cache
+    return _to_legacy(cache)   # shim: works on transformers 4 and 5
 
 
 def _model():

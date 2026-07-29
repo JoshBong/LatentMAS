@@ -69,25 +69,14 @@ class LatentMASMethod:
         start = tensor.shape[-2] - keep
         return tensor[..., start:, :].contiguous()
 
-    def _truncate_past(self, past_kv: Optional[Tuple], tokens_to_keep: int) -> Optional[Tuple]:
+    def _truncate_past(self, past_kv, tokens_to_keep: int):
+        # Keep the LAST tokens_to_keep positions. Delegated to the cache shim so
+        # it works across transformers 4/5 (the legacy cache API was removed in 5).
         if past_kv is None or tokens_to_keep <= 0:
             return None
-        if Cache is not None and isinstance(past_kv, Cache):
-            legacy = past_kv.to_legacy_cache()
-            trimmed_legacy = tuple(
-                tuple(self._slice_tensor(t, tokens_to_keep) for t in layer)
-                for layer in legacy
-            )
-            return past_kv.__class__.from_legacy_cache(trimmed_legacy)
-        trimmed_layers = []
-        for layer in past_kv:
-            if isinstance(layer, tuple):
-                trimmed_layers.append(tuple(self._slice_tensor(t, tokens_to_keep) for t in layer))
-            elif torch.is_tensor(layer):
-                trimmed_layers.append(self._slice_tensor(layer, tokens_to_keep))
-            else:
-                trimmed_layers.append(layer)
-        return tuple(trimmed_layers)
+        from methods.cache_ops import cache_length, cache_suffix
+        length = cache_length(past_kv)
+        return cache_suffix(past_kv, max(0, length - tokens_to_keep))
 
     @torch.no_grad()
     def run_batch(self, items: List[Dict]) -> List[Dict]:

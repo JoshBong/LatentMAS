@@ -17,13 +17,13 @@ in the stitched judge cache.
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from methods.cache_ops import cache_reindex, clone_cache
+from methods.cache_ops import _to_legacy, cache_reindex, clone_cache
 
 THETA = 10000.0
 
 
 def _legacy(c):
-    return c.to_legacy_cache() if hasattr(c, "to_legacy_cache") else c
+    return _to_legacy(c)   # shim: works on transformers 4 and 5
 
 
 def _model():

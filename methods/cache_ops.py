@@ -23,22 +23,36 @@ from typing import List, Sequence
 import torch
 
 
-def _is_cache_obj(cache) -> bool:
-    return hasattr(cache, "to_legacy_cache") and hasattr(type(cache), "from_legacy_cache")
-
-
 def _to_legacy(cache):
-    """-> tuple[layer] of (K, V). Accepts a Cache object or an already-legacy tuple."""
-    if _is_cache_obj(cache):
+    """-> tuple[layer] of (K, V). Handles a raw legacy tuple, a transformers-4
+    Cache (to_legacy_cache), and a transformers-5 Cache (.layers[i].keys/.values).
+
+    Fails CLOSED: an unrecognized cache raises rather than being passed through
+    as if it were a tuple -- the old feature-detection guard silently mis-
+    classified a v5 Cache (whose legacy methods were removed) as a plain tuple,
+    which then blew up downstream.
+    """
+    if cache is None or isinstance(cache, (tuple, list)):
+        return cache
+    if hasattr(cache, "to_legacy_cache"):                    # transformers 4 Cache
         return cache.to_legacy_cache()
-    return cache
+    if hasattr(cache, "layers"):                             # transformers 5 Cache
+        return tuple((layer.keys, layer.values) for layer in cache.layers)
+    raise TypeError(f"unrecognized cache type: {type(cache)!r}")
 
 
 def _from_legacy(legacy, like):
     """Rebuild a cache of the same kind as `like` from a legacy tuple."""
-    if _is_cache_obj(like):
+    if isinstance(like, (tuple, list)):
+        return legacy
+    if hasattr(type(like), "from_legacy_cache"):             # transformers 4 Cache
         return type(like).from_legacy_cache(legacy)
-    return legacy
+    if hasattr(like, "layers"):                              # transformers 5 Cache
+        rebuilt = type(like)()
+        for i, (k, v) in enumerate(legacy):
+            rebuilt.update(k, v, i)
+        return rebuilt
+    raise TypeError(f"cannot rebuild cache type: {type(like)!r}")
 
 
 def cache_length(cache) -> int:
