@@ -77,6 +77,10 @@ def process_batch(
             if latent_steps is not None:
                 print("[Latent Steps]")
                 print(latent_steps)
+            brief = a.get("brief")
+            if brief:
+                print("[Brief]")            # the orchestrator's routed sub-task for this worker
+                print(brief)
             print("[Output]")
             print(agent_output)
             print("----------------------------------------------")

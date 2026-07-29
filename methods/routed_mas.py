@@ -39,7 +39,14 @@ from prompts_routed import (
     build_routed_worker,
     parse_briefs,
 )
-from methods.cache_ops import cache_concat, cache_length, cache_reindex, cache_suffix, clone_cache
+from methods.cache_ops import (
+    cache_concat,
+    cache_length,
+    cache_reindex,
+    cache_suffix,
+    clone_cache,
+    read_rope_theta,
+)
 
 _ARTICLES = re.compile(r"\b(a|an|the)\b")
 
@@ -82,7 +89,9 @@ class RoutedMASMethod:
         self.reindex = not getattr(args, "no_reindex", False)
         hf = getattr(model, "HF_model", None) or getattr(model, "model", None)
         cfg = getattr(hf, "config", None)
-        self.rope_theta = float(getattr(cfg, "rope_theta", 10000.0)) if cfg is not None else 10000.0
+        # Read the EXACT rope_theta (raises if not found) -- only when reindexing,
+        # since a wrong value corrupts the cache. --no_reindex skips this.
+        self.rope_theta = read_rope_theta(cfg) if self.reindex else None
 
         # Workers = the non-judger custom agents if supplied, else N generic workers.
         custom = getattr(args, "custom_agents", None)

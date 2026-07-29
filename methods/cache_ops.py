@@ -83,6 +83,34 @@ def cache_suffix(cache, start: int):
     return _from_legacy(sliced, cache)
 
 
+def read_rope_theta(config) -> float:
+    """The model's rope_theta, across transformers 4 (config.rope_theta) and 5
+    (config.rope_parameters['rope_theta']).
+
+    RAISES if it can't be found. A wrong rope_theta silently corrupts every
+    reindexed key -- the rotation angle scales with it -- so guessing a default
+    is worse than crashing. Only called when reindexing is on; --no_reindex skips
+    it entirely.
+    """
+    if config is None:
+        raise ValueError("read_rope_theta: no model config provided")
+    theta = getattr(config, "rope_theta", None)
+    if theta is None:
+        for attr in ("rope_parameters", "rope_scaling"):
+            d = getattr(config, attr, None)
+            if isinstance(d, dict) and d.get("rope_theta") is not None:
+                theta = d["rope_theta"]
+                break
+    if theta is None:
+        raise ValueError(
+            "read_rope_theta: rope_theta not found on the model config (checked "
+            ".rope_theta, .rope_parameters, .rope_scaling). Reindex needs the exact "
+            "value and a wrong one corrupts the cache; refusing to guess. Pass "
+            "--no_reindex to skip reindexing."
+        )
+    return float(theta)
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
