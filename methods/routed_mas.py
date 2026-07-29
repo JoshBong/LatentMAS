@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import string
 from typing import Dict, List, Optional
 
 import torch
@@ -39,6 +40,17 @@ from prompts_routed import (
     parse_briefs,
 )
 from methods.cache_ops import cache_concat, cache_length, cache_reindex, cache_suffix, clone_cache
+
+_ARTICLES = re.compile(r"\b(a|an|the)\b")
+
+
+def _squad_norm(s: str) -> str:
+    """SQuAD/HotpotQA answer normalization: lowercase, drop punctuation and
+    articles, collapse whitespace. Used for both EM and F1 so they agree."""
+    s = (s or "").lower()
+    s = s.translate(str.maketrans("", "", string.punctuation))
+    s = _ARTICLES.sub(" ", s)
+    return " ".join(s.split())
 
 
 class RoutedMASMethod:
@@ -95,18 +107,22 @@ class RoutedMASMethod:
         return lines[-1] if lines else text.strip()
 
     def _score(self, pred_text: str, gold: str) -> tuple:
-        pred = normalize_answer(self._extract(pred_text)) or ""
-        gold = (gold or "").strip().lower()
+        """Exact match after SQuAD/HotpotQA normalization (the standard EM).
+
+        No substring leniency: 'pred in gold' would score pred='a' correct
+        against gold='canada'. Partial credit lives in F1, not here.
+        """
+        pred = _squad_norm(self._extract(pred_text))
+        gold = _squad_norm(gold)
         if not gold:
             return pred, False
-        ok = (pred == gold) or (gold in pred) or (pred in gold and len(pred) > 0)
-        return pred, bool(ok)
+        return pred, (pred == gold)
 
     @staticmethod
     def _f1(pred: str, gold: str) -> float:
         """HotpotQA-style token-overlap F1 between the extracted answer and gold."""
-        p = (normalize_answer(pred) or "").split()
-        g = (normalize_answer(gold) or "").split()
+        p = _squad_norm(pred).split()
+        g = _squad_norm(gold).split()
         if not p or not g:
             return float(p == g)
         common = 0
