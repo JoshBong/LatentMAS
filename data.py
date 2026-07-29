@@ -241,10 +241,14 @@ def load_hotpotqa(split: str = "validation", cache_dir: Optional[str] = None) ->
         sentences = ctx["sentences"]
         docs = [f"{t}: {' '.join(s)}".strip() for t, s in zip(titles, sentences)]
         question_full = question + "\n\nContext:\n" + "\n\n".join(docs)
+        sf = item.get("supporting_facts") or {}
+        gold_titles = sorted(set(sf.get("title", []))) if isinstance(sf, dict) else []
         yield {
             "question": question,
             "context_docs": docs,
             "question_full": question_full,
             "solution": answer,
             "gold": normalize_answer(answer),
+            "type": item.get("type", ""),                 # 'comparison' | 'bridge'
+            "supporting_titles": gold_titles,             # the router's answer key
         }
