@@ -82,9 +82,14 @@ class ModelWrapper:
             load_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         else:
             load_dtype = torch.float32
+        # low_cpu_mem_usage avoids the ~2x-model-size RAM spike during loading that
+        # SIGKILLs (-9) a 4B model on Colab's ~12.7GB RAM. The print surfaces whether
+        # CUDA is actually active -- fp32 on a CPU runtime is the other way to OOM.
+        print(f"[ModelWrapper] loading {model_name} | cuda={torch.cuda.is_available()} "
+              f"| dtype={load_dtype} | device={device}", flush=True)
         with torch.no_grad():
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_name, torch_dtype=load_dtype,
+                model_name, torch_dtype=load_dtype, low_cpu_mem_usage=True,
             )
         if len(self.tokenizer) != self.model.get_input_embeddings().weight.shape[0]:
             self.model.resize_token_embeddings(len(self.tokenizer))
