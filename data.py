@@ -6,7 +6,7 @@ from utils import extract_gold, normalize_answer
 
 
 def load_gsm8k(split: str = "test", cache_dir: Optional[str] = None) -> Iterable[Dict]:
-    ds = load_dataset("gsm8k", "main", split=split, cache_dir=cache_dir)
+    ds = load_dataset("openai/gsm8k", "main", split=split, cache_dir=cache_dir)
     for item in ds:
         question = item["question"].strip()
         solution = item["answer"]
@@ -232,8 +232,7 @@ def load_hotpotqa(split: str = "validation", cache_dir: Optional[str] = None) ->
     `question_full` (question + all docs, for the non-routed comparison arms so
     they see the same evidence).
     """
-    ds = load_dataset("hotpot_qa", "distractor", split=split, cache_dir=cache_dir,
-                      trust_remote_code=True)
+    ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split=split, cache_dir=cache_dir)
     for item in ds:
         question = item["question"].strip()
         answer = str(item["answer"]).strip()
