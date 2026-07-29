@@ -84,6 +84,9 @@ class RoutedMASMethod:
         # 'orchestrated' = the lead decodes a brief per worker (route out with
         # text); 'static' = fixed contiguous doc split, generic briefs.
         self.routing = getattr(args, "routing", "orchestrated")
+        # Backstop only -- with enable_thinking=False the orchestrator hits EOS well
+        # inside this. If experiments/inspect_orchestrator.py shows truncation, raise
+        # it; a cap should never be the normal terminator.
         self.orchestrator_max_new_tokens = getattr(args, "orchestrator_max_new_tokens", 256)
         # De-entangle RoPE positions in the stitched judge cache (default on).
         self.reindex = not getattr(args, "no_reindex", False)
@@ -168,14 +171,20 @@ class RoutedMASMethod:
             _, o_ids, o_mask, _ = model.prepare_chat_batch(
                 [build_orchestrator_prompt(question, self.n_workers, context_docs, self.args)],
                 add_generation_prompt=True,
+                enable_thinking=False,   # emit briefs directly; don't spend the budget thinking
             )
             o_gen, _ = model.generate_text_batch(
                 o_ids, o_mask, max_new_tokens=self.orchestrator_max_new_tokens,
                 temperature=self.temperature, top_p=self.top_p, past_key_values=None,
             )
-            # n_briefs_parsed < n_workers => some briefs were padded (generic) =>
-            # workers won't differentiate; logged so it can't hide as low divergence.
             briefs, n_briefs_parsed = parse_briefs(o_gen[0], self.n_workers)
+            # A cap should never be what ends this normally -- with thinking off the
+            # model reaches EOS well within budget. If it didn't, say so loudly:
+            # padded briefs make workers identical and tank divergence.
+            if n_briefs_parsed < self.n_workers:
+                print(f"[routed_mas] WARNING: orchestrator emitted {n_briefs_parsed}/"
+                      f"{self.n_workers} real briefs; {self.n_workers - n_briefs_parsed} padded "
+                      f"-> those workers won't differentiate (divergence reads low).")
 
         # -- Phase 2: fan out; each worker runs from an independent clone of S0 --
         worker_caches = []

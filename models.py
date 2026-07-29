@@ -95,12 +95,19 @@ class ModelWrapper:
         if self.latent_space_realign:
             self._ensure_latent_realign_matrix(self.model, self.device, args)
 
-    def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True) -> str:
+    def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True,
+                    enable_thinking: bool = True) -> str:
         tpl = getattr(self.tokenizer, "chat_template", None)
         if tpl:
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=add_generation_prompt
-            )
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=add_generation_prompt,
+                    enable_thinking=enable_thinking,
+                )
+            except TypeError:   # template that doesn't accept the kwarg
+                return self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=add_generation_prompt
+                )
         segments = []
         for message in messages:
             role = message.get("role", "user")
@@ -129,10 +136,13 @@ class ModelWrapper:
         self,
         batch_messages: List[List[Dict]],
         add_generation_prompt: bool = True,
+        enable_thinking: bool = True,
     ) -> Tuple[List[str], torch.Tensor, torch.Tensor, List[List[str]]]:
         prompts: List[str] = []
         for messages in batch_messages:
-            prompts.append(self.render_chat(messages, add_generation_prompt=add_generation_prompt))
+            prompts.append(self.render_chat(
+                messages, add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking))
         encoded = self.tokenizer(
             prompts,
             return_tensors="pt",

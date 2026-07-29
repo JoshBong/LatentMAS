@@ -67,6 +67,7 @@ def build_orchestrator_prompt(question: str, n_workers: int,
 
 Assign one focused subtask to each of {n_workers} workers. Make them cover
 different parts of the question / different sources -- do NOT give overlapping work.
+Keep each subtask to ONE concise sentence (under 20 words).
 
 Output EXACTLY {n_workers} lines, no more, in this format:
 Worker 1: <subtask>

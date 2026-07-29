@@ -34,7 +34,7 @@ class _FakeWrapper:
         ids = [ord(c) % self.vocab for c in text][:24] or [0]
         return torch.tensor([ids])
 
-    def prepare_chat_batch(self, batch_messages, add_generation_prompt=True):
+    def prepare_chat_batch(self, batch_messages, add_generation_prompt=True, enable_thinking=True):
         ids = self._encode(batch_messages[0])
         mask = torch.ones_like(ids)
         return ["p"], ids, mask, [["t"]]
