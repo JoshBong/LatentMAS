@@ -55,8 +55,8 @@ def process_batch(
     for offset, res in enumerate(results):
         preds.append(res)
         if args.log_file:
-            keep = ("question", "gold", "prediction", "correct", "f1", "routing",
-                    "worker_divergence", "n_workers", "n_briefs_parsed", "briefs")
+            keep = ("question", "gold", "prediction", "raw_prediction", "correct", "f1",
+                    "routing", "worker_divergence", "n_workers", "n_briefs_parsed", "briefs")
             with open(args.log_file, "a", encoding="utf-8") as lf:
                 lf.write(json.dumps({k: res.get(k) for k in keep}, ensure_ascii=False) + "\n")
         problem_idx = batch_start + offset + 1

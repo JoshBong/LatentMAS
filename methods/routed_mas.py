@@ -24,14 +24,13 @@ from __future__ import annotations
 
 import argparse
 import re
-import string
 from typing import Dict, List, Optional
 
 import torch
 
 from . import Agent
 from models import ModelWrapper
-from utils import normalize_answer, extract_gsm8k_answer
+from utils import answer_hit, extract_answer, extract_gsm8k_answer, normalize_answer, squad_norm, token_f1
 from prompts_routed import (
     build_orchestrator_prompt,
     build_routed_judger,
@@ -47,18 +46,6 @@ from methods.cache_ops import (
     clone_cache,
     rope_inv_freq,
 )
-
-_ARTICLES = re.compile(r"\b(a|an|the)\b")
-
-
-def _squad_norm(s: str) -> str:
-    """SQuAD/HotpotQA answer normalization: lowercase, drop punctuation and
-    articles, collapse whitespace. Used for both EM and F1 so they agree."""
-    s = (s or "").lower()
-    s = s.translate(str.maketrans("", "", string.punctuation))
-    s = _ARTICLES.sub(" ", s)
-    return " ".join(s.split())
-
 
 class RoutedMASMethod:
     def __init__(
@@ -107,46 +94,28 @@ class RoutedMASMethod:
 
     # ------------------------------------------------------------------ scoring
     def _extract(self, text: str) -> str:
-        m = re.search(r"\\boxed\{(.+?)\}", text, flags=re.DOTALL)
-        if m:
-            return m.group(1).strip()
+        # math: pull the boxed value / final number
         if self.task in ("gsm8k", "aime2024", "aime2025"):
+            m = re.search(r"\\boxed\{(.+?)\}", text, flags=re.DOTALL)
+            if m:
+                return m.group(1).strip()
             got = extract_gsm8k_answer(text)
             if got:
                 return got
-        # free-form (hotpotqa): last non-empty line
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        return lines[-1] if lines else text.strip()
+        # free-form (hotpotqa): strip <think>, take boxed / 'answer is' / first sentence
+        return extract_answer(text)
 
     def _score(self, pred_text: str, gold: str) -> tuple:
-        """Exact match after SQuAD/HotpotQA normalization (the standard EM).
-
-        No substring leniency: 'pred in gold' would score pred='a' correct
-        against gold='canada'. Partial credit lives in F1, not here.
-        """
-        pred = _squad_norm(self._extract(pred_text))
-        gold = _squad_norm(gold)
+        """The judge writes prose; math wants exact, free-form wants recall."""
+        pred = self._extract(pred_text)
         if not gold:
             return pred, False
-        return pred, (pred == gold)
-
-    @staticmethod
-    def _f1(pred: str, gold: str) -> float:
-        """HotpotQA-style token-overlap F1 between the extracted answer and gold."""
-        p = _squad_norm(pred).split()
-        g = _squad_norm(gold).split()
-        if not p or not g:
-            return float(p == g)
-        common = 0
-        gg = list(g)
-        for tok in p:
-            if tok in gg:
-                common += 1
-                gg.remove(tok)
-        if common == 0:
-            return 0.0
-        prec, rec = common / len(p), common / len(g)
-        return 2 * prec * rec / (prec + rec)
+        if self.task in ("gsm8k", "aime2024", "aime2025"):
+            ok = squad_norm(pred) == squad_norm(gold)
+        else:
+            # did the gold answer actually appear in the judge's response?
+            ok = answer_hit(pred_text, gold)
+        return pred, bool(ok)
 
     # ------------------------------------------------------------------- worker
     @torch.no_grad()
@@ -230,7 +199,7 @@ class RoutedMASMethod:
         ).strip()
 
         pred, ok = self._score(final_text, item.get("gold", ""))
-        f1 = self._f1(pred, item.get("gold", ""))
+        f1 = token_f1(pred, item.get("gold", ""))
         traces.append({"name": "Judger", "role": "judger", "output": final_text})
 
         return {

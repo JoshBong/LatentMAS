@@ -67,7 +67,7 @@ class _FakeWrapper:
         out = self.model(input_ids=input_ids, attention_mask=full_mask,
                          past_key_values=past_key_values, position_ids=pos, use_cache=True)
         assert out.logits.shape[1] == input_ids.shape[-1]      # stitched cache accepted
-        return "the answer is \\boxed{paris}"
+        return "The answer is Paris."
 
 
 class _Args:
@@ -90,7 +90,7 @@ def test_orchestrated_pipeline_runs_end_to_end():
     })
     assert res["n_workers"] == 3
     assert res["routing"] == "orchestrated"
-    assert res["prediction"] == "paris" and res["correct"] is True   # stubbed decode
+    assert res["prediction"].lower() == "paris" and res["correct"] is True   # stubbed decode
     assert isinstance(res["f1"], float)
     assert res["briefs"] is not None and len(res["briefs"]) == 3     # lead's briefs parsed + kept
     assert isinstance(res["worker_divergence"], float)

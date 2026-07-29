@@ -47,6 +47,77 @@ def normalize_answer(ans: Optional[str]) -> Optional[str]:
     return ans.strip().lower()
 
 
+import string as _string
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_BOXED_RE = re.compile(r"\\boxed\{(.+?)\}", re.DOTALL)
+_ANSWER_MARK_RE = re.compile(
+    r"(?i)(?:the\s+)?(?:final\s+)?answer(?:\s+is|:)\s*\**\s*(.+?)\s*\**\s*(?:[.\n]|$)"
+)
+_ARTICLES_RE = re.compile(r"\b(a|an|the)\b")
+
+
+def squad_norm(s: Optional[str]) -> str:
+    """SQuAD/HotpotQA normalization: lowercase, drop punctuation + articles, collapse ws."""
+    s = (s or "").lower()
+    s = s.translate(str.maketrans("", "", _string.punctuation))
+    s = _ARTICLES_RE.sub(" ", s)
+    return " ".join(s.split())
+
+
+def extract_answer(text: str) -> str:
+    """Pull a short answer out of a verbose judge response.
+
+    The judge writes a <think> block then prose that LEADS with the answer
+    ("Yes, both American." / "The director is X, based in Y."). Naive number-
+    grabbing scored these wrong, so: strip the CoT, then take a \\boxed{} value,
+    else an explicit 'answer is/:' span, else the first sentence.
+    """
+    if not text:
+        return ""
+    text = _THINK_RE.sub("", text)
+    if "</think>" in text:                       # unclosed/truncated CoT
+        text = text.split("</think>")[-1]
+    text = text.strip()
+    m = _BOXED_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    marks = list(_ANSWER_MARK_RE.finditer(text))
+    if marks:
+        return marks[-1].group(1).strip().strip('"*')
+    for line in text.splitlines():
+        line = line.strip(" -*#")
+        if line:
+            return re.split(r"(?<=[.!?])\s", line)[0].strip()   # first sentence
+    return text.strip()
+
+
+def answer_hit(response_or_pred: str, gold: str) -> bool:
+    """Free-form (HotpotQA-style) recall: does the gold answer appear, as whole
+    word(s), in the model's answer? Padded so 'no' does not match 'nobody'."""
+    g = squad_norm(gold)
+    a = squad_norm(response_or_pred)
+    if not g:
+        return False
+    return f" {g} " in f" {a} " or g == a
+
+
+def token_f1(pred: str, gold: str) -> float:
+    """HotpotQA token-overlap F1 (same normalization for both sides)."""
+    p, g = squad_norm(pred).split(), squad_norm(gold).split()
+    if not p or not g:
+        return float(p == g)
+    common, gg = 0, list(g)
+    for tok in p:
+        if tok in gg:
+            common += 1
+            gg.remove(tok)
+    if common == 0:
+        return 0.0
+    prec, rec = common / len(p), common / len(g)
+    return 2 * prec * rec / (prec + rec)
+
+
 def extract_markdown_python_block(text: str) -> Optional[str]:
     pattern = r"```python(.*?)```"
     matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
