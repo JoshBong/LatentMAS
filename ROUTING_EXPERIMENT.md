@@ -138,3 +138,24 @@ python run.py --method routed_mas --task gsm8k --model_name Qwen/Qwen3-4B \
 **Worth an A/B once it runs:** `--no_reindex` vs default. The RoPE fix makes the stitched judge cache positionally clean; if it materially helps HotpotQA acc, that's a real ablation for the writeup (and confirms position entanglement was hurting the judge).
 
 **Known limits:** bs=1 (slow, fine for a first read); static doc→worker mapping even in orchestrated mode (the lead writes sub-tasks but docs are still split contiguously — matching sub-task↔doc is a later knob); F1 is token-overlap, not the official HotpotQA supporting-fact metric.
+
+## The channel is not compressed yet — the bound, and the next arm
+
+`cache_suffix(S_w, base_len)` keeps each worker's `[brief + its documents + latent steps]`. Since `build_routed_worker` puts the doc slice *in the brief*, **the judge re-reads every document** — split across workers and glued back, but the same evidence. So today "workers return latent findings" is really "latent findings *plus everything they read*." Routing reorders the judge's evidence; it does not reduce it.
+
+**The bound this implies (quotable, not an embarrassment).** Qwen3-4B KV ≈ 144 KB/token (36 layers × 8 KV heads × 128 × 2 × fp16). A hotpot worker suffix ≈ 610 tok (docs + brief + 10 latents), so the judge context = N × 610:
+
+| N | judge ctx (tok) | vs 32k window |
+|---|---|---|
+| 3 | 1,830 | fine |
+| 10 | 6,100 | fine |
+| 30 | 18,300 | near the wall |
+| 100 | 61,000 | **exceeds 32k** |
+
+Context length is the harder wall than VRAM, and reindex makes it worse *by design* — each worker sits after the previous, so the judge lands at position `Σ(all workers)`. **With full suffixes, ~30 workers is the ceiling on a 32k model.** That's a limitations paragraph.
+
+**The compression arm (`routed_latentonly`) — the real test of the thesis, queued after the current matrix.** Slice one step further:
+```python
+cache_suffix(S_w, base_len + prompt_len)   # latent steps ONLY (needs latent_steps > 0)
+```
+Judge context = N × latent_steps: N=3→30 tok, N=100→1,000 tok (~61× smaller; 100 workers becomes trivial). The **gap between `routed` and `routed_latentonly`** measures how much the latent channel actually carries — a small gap = genuine compression (the O(1)-per-agent claim holds); a large gap = the latent state isn't doing the work. Either way it's a stronger result than the current headline, and it's the arm that directly tests DeltaMAS's central premise (channel bounded by `latent_steps`, not by how much the worker read). ~8 lines: track per-worker `prompt_len`, add a `--channel {full,latent}` flag, use it in the suffix. **Not built — the current matrix has to run first.**
