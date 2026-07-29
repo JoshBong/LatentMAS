@@ -70,10 +70,14 @@ class ModelWrapper:
         # fallback: normal transformers path
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         _ensure_pad_token(self.tokenizer)
+        if torch.cuda.is_available():
+            # bf16 needs Ampere+ (L4/A10/A100/3090/4090); a T4 is Turing -> fp16.
+            load_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            load_dtype = torch.float32
         with torch.no_grad():
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+                model_name, torch_dtype=load_dtype,
             )
         if len(self.tokenizer) != self.model.get_input_embeddings().weight.shape[0]:
             self.model.resize_token_embeddings(len(self.tokenizer))
