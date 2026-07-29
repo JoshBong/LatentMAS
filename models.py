@@ -20,11 +20,18 @@ def _ensure_pad_token(tokenizer: AutoTokenizer) -> None:
             tokenizer.add_special_tokens({"pad_token": "<pad>"})
 
 
-def _past_length(past_key_values: Optional[Tuple]) -> int:
-    if not past_key_values:
+def _past_length(past_key_values) -> int:
+    if past_key_values is None:
         return 0
-    k = past_key_values[0][0]
-    return k.shape[-2]
+    # transformers 4/5 Cache objects: ask the object (subscripting was removed in v5)
+    if hasattr(past_key_values, "get_seq_length"):
+        return int(past_key_values.get_seq_length())
+    if hasattr(past_key_values, "layers"):
+        layers = past_key_values.layers
+        return int(layers[0].keys.shape[-2]) if layers else 0
+    if not past_key_values:                       # empty legacy tuple / None-ish
+        return 0
+    return int(past_key_values[0][0].shape[-2])   # legacy tuple of (K, V)
 
 
 class ModelWrapper:
@@ -70,10 +77,14 @@ class ModelWrapper:
         # fallback: normal transformers path
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         _ensure_pad_token(self.tokenizer)
+        if torch.cuda.is_available():
+            # bf16 needs Ampere+ (L4/A10/A100/3090/4090); a T4 is Turing -> fp16.
+            load_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            load_dtype = torch.float32
         with torch.no_grad():
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+                model_name, torch_dtype=load_dtype,
             )
         if len(self.tokenizer) != self.model.get_input_embeddings().weight.shape[0]:
             self.model.resize_token_embeddings(len(self.tokenizer))
@@ -266,6 +277,51 @@ class ModelWrapper:
             generations.append(text)
         return generations, outputs.past_key_values
 
+    @torch.no_grad()
+    def decode_from_cache(self, input_ids, past_key_values, max_new_tokens: int = 64,
+                          eos_id: Optional[int] = None) -> str:
+        """Greedy-decode `input_ids` on top of a prefilled cache, via manual forwards.
+
+        HF `generate()` assumes past_key_values is a prefix of the ongoing
+        sequence; here the cache is SEPARATE content (the workers' states) that
+        the judge attends to but which is not a literal prefix of the judge
+        prompt -- so generate()'s bookkeeping breaks. This loop makes no such
+        assumption: it just forwards the judge tokens over the given cache, with
+        positions continuing from the cache length. (Same reason LatentMAS
+        bypasses generate() in its latent loop.)
+        """
+        hf = getattr(self, "HF_model", None) or self.model
+        dev = self.device
+        ids = input_ids.to(dev)
+        if eos_id is None:
+            eos_id = self.tokenizer.eos_token_id
+
+        past = past_key_values
+        plen = _past_length(past)
+        pos = torch.arange(plen, plen + ids.shape[-1], device=dev).unsqueeze(0)
+        attn = torch.ones(1, plen + ids.shape[-1], dtype=torch.long, device=dev)
+        out = hf(input_ids=ids, attention_mask=attn, position_ids=pos,
+                 past_key_values=past, use_cache=True)
+        past = out.past_key_values
+        nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+
+        gen = []
+        for _ in range(max_new_tokens):
+            if eos_id is not None and int(nxt.item()) == eos_id:
+                break
+            gen.append(nxt)
+            plen = _past_length(past)
+            pos = torch.tensor([[plen]], device=dev)
+            attn = torch.ones(1, plen + 1, dtype=torch.long, device=dev)
+            out = hf(input_ids=nxt, attention_mask=attn, position_ids=pos,
+                     past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+
+        if not gen:
+            return ""
+        return self.tokenizer.decode(torch.cat(gen, dim=1)[0], skip_special_tokens=True)
+
     def tokenize_text(self, text: str) -> torch.Tensor:
         return self.tokenizer(
             text,
@@ -360,10 +416,14 @@ class ModelWrapper:
     ) -> Tuple:
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
+        # Fall back to the single HF model / device when there is no separate
+        # second HF model (i.e. the plain non-vLLM path, e.g. CPU/MPS).
+        hf = getattr(self, "HF_model", None) or self.model
+        hf_dev = getattr(self, "HF_device", None) or self.device
         if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, device=self.HF_device)
+            attention_mask = torch.ones_like(input_ids, device=hf_dev)
         else:
-            attention_mask = attention_mask.to(self.HF_device)
+            attention_mask = attention_mask.to(hf_dev)
         if past_key_values is not None:
             past_len = _past_length(past_key_values)
             if past_len > 0:
@@ -373,7 +433,7 @@ class ModelWrapper:
                     device=attention_mask.device,
                 )
                 attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
-        outputs = self.HF_model(
+        outputs = hf(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -399,7 +459,7 @@ class ModelWrapper:
                 dtype=torch.long,
                 device=latent_embed.device,
             )
-            outputs = self.HF_model(
+            outputs = hf(
                 inputs_embeds=latent_embed,
                 attention_mask=latent_mask,
                 past_key_values=past,

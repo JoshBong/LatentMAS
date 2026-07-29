@@ -50,11 +50,15 @@ class LatentMASMethod:
         if self.latent_only:
             self.sequential_info_only = True
 
-        self.sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=args.max_new_tokens,
-        )
+        # vLLM-only; the non-vLLM (HF/CPU/MPS) path never touches it.
+        try:
+            self.sampling_params = SamplingParams(
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=args.max_new_tokens,
+            )
+        except NameError:
+            self.sampling_params = None
         self.task = args.task
 
     @staticmethod
@@ -65,25 +69,14 @@ class LatentMASMethod:
         start = tensor.shape[-2] - keep
         return tensor[..., start:, :].contiguous()
 
-    def _truncate_past(self, past_kv: Optional[Tuple], tokens_to_keep: int) -> Optional[Tuple]:
+    def _truncate_past(self, past_kv, tokens_to_keep: int):
+        # Keep the LAST tokens_to_keep positions. Delegated to the cache shim so
+        # it works across transformers 4/5 (the legacy cache API was removed in 5).
         if past_kv is None or tokens_to_keep <= 0:
             return None
-        if Cache is not None and isinstance(past_kv, Cache):
-            legacy = past_kv.to_legacy_cache()
-            trimmed_legacy = tuple(
-                tuple(self._slice_tensor(t, tokens_to_keep) for t in layer)
-                for layer in legacy
-            )
-            return past_kv.__class__.from_legacy_cache(trimmed_legacy)
-        trimmed_layers = []
-        for layer in past_kv:
-            if isinstance(layer, tuple):
-                trimmed_layers.append(tuple(self._slice_tensor(t, tokens_to_keep) for t in layer))
-            elif torch.is_tensor(layer):
-                trimmed_layers.append(self._slice_tensor(layer, tokens_to_keep))
-            else:
-                trimmed_layers.append(layer)
-        return tuple(trimmed_layers)
+        from methods.cache_ops import cache_length, cache_suffix
+        length = cache_length(past_kv)
+        return cache_suffix(past_kv, max(0, length - tokens_to_keep))
 
     @torch.no_grad()
     def run_batch(self, items: List[Dict]) -> List[Dict]:
@@ -240,14 +233,21 @@ class LatentMASMethod:
                 for ids_row, mask_row in zip(final_agent_ids, final_agent_mask):
                     active_ids = ids_row[mask_row.bool()].tolist()
                     final_agent_tokens_batch.append(self.model.tokenizer.convert_ids_to_tokens(active_ids))
-                generated_batch, _ = self.model.generate_text_batch(
-                    final_agent_ids,
-                    final_agent_mask,
-                    max_new_tokens=self.judger_max_new_tokens,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    past_key_values=past_for_decoding,
-                )
+                if batch_size == 1:
+                    # HF path: generate() can't take a non-prefix past (the latent
+                    # cache is not a prefix of the judge prompt). Decode manually.
+                    generated_batch = [self.model.decode_from_cache(
+                        final_agent_ids, past_for_decoding,
+                        max_new_tokens=self.judger_max_new_tokens)]
+                else:
+                    generated_batch, _ = self.model.generate_text_batch(
+                        final_agent_ids,
+                        final_agent_mask,
+                        max_new_tokens=self.judger_max_new_tokens,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        past_key_values=past_for_decoding,
+                    )
                 for idx in range(batch_size):
                     final_text = generated_batch[idx].strip()
                     final_texts[idx] = final_text
