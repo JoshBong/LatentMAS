@@ -83,32 +83,28 @@ def cache_suffix(cache, start: int):
     return _from_legacy(sliced, cache)
 
 
-def read_rope_theta(config) -> float:
-    """The model's rope_theta, across transformers 4 (config.rope_theta) and 5
-    (config.rope_parameters['rope_theta']).
+def rope_inv_freq(model):
+    """The rotary frequencies the model ACTUALLY uses, read off its buffer.
 
-    RAISES if it can't be found. A wrong rope_theta silently corrupts every
-    reindexed key -- the rotation angle scales with it -- so guessing a default
-    is worse than crashing. Only called when reindexing is on; --no_reindex skips
-    it entirely.
+    Strictly better than reconstructing them from rope_theta: no config-key
+    guessing (the key moved to config.rope_parameters in transformers 5), no
+    head_dim assumption, and correct under rope_scaling -- linear/YaRN fold their
+    factor into inv_freq, which rope_theta alone does not capture.
+
+    Raises on dynamic NTK rope, whose inv_freq mutates with sequence length so a
+    single-offset key rotation would be wrong; and raises if there is no rotary
+    embedding at all (rather than guessing a default that silently corrupts).
     """
-    if config is None:
-        raise ValueError("read_rope_theta: no model config provided")
-    theta = getattr(config, "rope_theta", None)
-    if theta is None:
-        for attr in ("rope_parameters", "rope_scaling"):
-            d = getattr(config, attr, None)
-            if isinstance(d, dict) and d.get("rope_theta") is not None:
-                theta = d["rope_theta"]
-                break
-    if theta is None:
-        raise ValueError(
-            "read_rope_theta: rope_theta not found on the model config (checked "
-            ".rope_theta, .rope_parameters, .rope_scaling). Reindex needs the exact "
-            "value and a wrong one corrupts the cache; refusing to guess. Pass "
-            "--no_reindex to skip reindexing."
-        )
-    return float(theta)
+    for mod in model.modules():
+        inv = getattr(mod, "inv_freq", None)
+        if inv is not None:
+            if getattr(mod, "rope_type", "default") == "dynamic":
+                raise ValueError(
+                    "dynamic NTK rope mutates inv_freq with sequence length; "
+                    "cache key rotation is not valid for this model"
+                )
+            return inv.detach().float()
+    raise ValueError("no rotary embedding (inv_freq) found -- is this a RoPE model?")
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -116,7 +112,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
 
 
-def cache_reindex(cache, delta: int, rope_theta: float = 10000.0):
+def cache_reindex(cache, delta: int, inv_freq):
     """Shift a cache's KEYS forward by `delta` positions, via RoPE composition.
 
     A RoPE'd key at position p is R(p)·k0; because rotations compose,
@@ -129,23 +125,24 @@ def cache_reindex(cache, delta: int, rope_theta: float = 10000.0):
     worker w by the total length of the workers before it makes the concatenated
     cache positionally identical to a single sequential read.
 
-    `rope_theta` MUST match the model (Qwen3 uses 1e6, not 1e4). head_dim is read
-    off the cache. Only valid for RoPE models (no-op semantics on learned-pos
-    models -- do not call it there).
+    `inv_freq` is the model's own rotary frequencies (rope_inv_freq(model)) --
+    read off the model, not reconstructed from a config key, so it stays correct
+    across transformers versions and under rope_scaling. Any per-frequency
+    attention_scaling is already baked into the cached keys and cancels in the
+    composition R(delta)·s·R(p)·k = s·R(p+delta)·k, so it is intentionally not
+    reapplied here.
     """
     if delta == 0:
         return clone_cache(cache)
     legacy = _to_legacy(cache)
     K0 = legacy[0][0]
-    head_dim = K0.shape[-1]
-    inv_freq = 1.0 / (rope_theta ** (
-        torch.arange(0, head_dim, 2, dtype=torch.float32, device=K0.device) / head_dim))
-    ang = float(delta) * inv_freq                      # [head_dim/2]
-    emb = torch.cat([ang, ang], dim=-1)                # [head_dim]
+    inv = inv_freq.to(device=K0.device, dtype=torch.float32)    # [head_dim/2]
+    ang = float(delta) * inv
+    emb = torch.cat([ang, ang], dim=-1)                         # [head_dim]
     cos = emb.cos().to(K0.dtype)
     sin = emb.sin().to(K0.dtype)
     out = tuple(
-        ((k * cos) + (_rotate_half(k) * sin), v)       # rotate K, leave V
+        ((k * cos) + (_rotate_half(k) * sin), v)               # rotate K, leave V
         for (k, v) in legacy
     )
     return _from_legacy(out, cache)

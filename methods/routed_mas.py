@@ -45,7 +45,7 @@ from methods.cache_ops import (
     cache_reindex,
     cache_suffix,
     clone_cache,
-    read_rope_theta,
+    rope_inv_freq,
 )
 
 _ARTICLES = re.compile(r"\b(a|an|the)\b")
@@ -88,10 +88,10 @@ class RoutedMASMethod:
         # De-entangle RoPE positions in the stitched judge cache (default on).
         self.reindex = not getattr(args, "no_reindex", False)
         hf = getattr(model, "HF_model", None) or getattr(model, "model", None)
-        cfg = getattr(hf, "config", None)
-        # Read the EXACT rope_theta (raises if not found) -- only when reindexing,
-        # since a wrong value corrupts the cache. --no_reindex skips this.
-        self.rope_theta = read_rope_theta(cfg) if self.reindex else None
+        # Read the model's actual rotary frequencies (raises if absent) -- only
+        # when reindexing, since a wrong value corrupts the cache. --no_reindex
+        # skips this entirely.
+        self.rope_inv_freq = rope_inv_freq(hf) if self.reindex else None
 
         # Workers = the non-judger custom agents if supplied, else N generic workers.
         custom = getattr(args, "custom_agents", None)
@@ -163,6 +163,7 @@ class RoutedMASMethod:
 
         # -- Phase 1b: orchestrator decodes one brief per worker (route OUT = text) --
         briefs = None
+        n_briefs_parsed = None
         if self.routing == "orchestrated":
             _, o_ids, o_mask, _ = model.prepare_chat_batch(
                 [build_orchestrator_prompt(question, self.n_workers, context_docs, self.args)],
@@ -172,7 +173,9 @@ class RoutedMASMethod:
                 o_ids, o_mask, max_new_tokens=self.orchestrator_max_new_tokens,
                 temperature=self.temperature, top_p=self.top_p, past_key_values=None,
             )
-            briefs = parse_briefs(o_gen[0], self.n_workers)
+            # n_briefs_parsed < n_workers => some briefs were padded (generic) =>
+            # workers won't differentiate; logged so it can't hide as low divergence.
+            briefs, n_briefs_parsed = parse_briefs(o_gen[0], self.n_workers)
 
         # -- Phase 2: fan out; each worker runs from an independent clone of S0 --
         worker_caches = []
@@ -203,7 +206,7 @@ class RoutedMASMethod:
         for S_w in worker_caches:
             suf = cache_suffix(S_w, base_len)
             if self.reindex and offset > 0:
-                suf = cache_reindex(suf, offset, rope_theta=self.rope_theta)
+                suf = cache_reindex(suf, offset, inv_freq=self.rope_inv_freq)
             suffixes.append(suf)
             offset += cache_length(suf)
         combined = cache_concat([S0] + suffixes)
@@ -232,6 +235,7 @@ class RoutedMASMethod:
             "f1": f1,
             "routing": self.routing,
             "briefs": briefs,
+            "n_briefs_parsed": n_briefs_parsed,
             "worker_divergence": self._divergence(worker_embeds),
             "n_workers": self.n_workers,
         }

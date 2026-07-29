@@ -76,19 +76,23 @@ Worker {n_workers}: <subtask>"""
     return _msgs(ORCHESTRATOR_SYSTEM, user)
 
 
-def parse_briefs(text: str, n_workers: int) -> List[str]:
+def parse_briefs(text: str, n_workers: int):
     """Pull 'Worker i: <brief>' lines from the orchestrator's decode.
 
-    Robust to slop: takes the first N matches in order, pads with a generic
-    brief if the model under-produced, truncates if it over-produced.
+    Returns (briefs, n_matched). n_matched is how many real 'Worker i:' lines the
+    model actually produced -- callers should record it, because under-production
+    is padded with a generic brief here, and padded briefs make workers near-
+    identical -> divergence collapses -> looks like 'routing doesn't help' when
+    the real problem is the orchestrator prompt. Truncates on over-production.
     """
     found: List[str] = []
     for m in re.finditer(r"(?im)^\s*worker\s*\d+\s*[:\-.)]\s*(.+?)\s*$", text):
         found.append(m.group(1).strip())
+    n_matched = len(found)
     briefs = found[:n_workers]
     while len(briefs) < n_workers:
         briefs.append(f"Cover the part of the question not addressed by workers 1-{len(briefs)}.")
-    return briefs
+    return briefs, n_matched
 
 
 def build_routed_worker(

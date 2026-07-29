@@ -79,7 +79,9 @@ def main():
     print(f"{len(runs)} runs -> {out}\n")
 
     for i, (arm, task, seed) in enumerate(runs, 1):
-        rid = f"{arm}__{task}__seed{seed}"
+        # worker count in the id so `--num_workers 2` vs `3` don't collide
+        nw = f"__nw{args.num_workers}" if arm.startswith("routed") else ""
+        rid = f"{arm}{nw}__{task}__seed{seed}"
         rdir = out / rid
         rdir.mkdir(exist_ok=True)
         if (rdir / "summary.json").exists():
