@@ -17,7 +17,7 @@ in the stitched judge cache.
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from methods.cache_ops import _to_legacy, cache_reindex, clone_cache
+from methods.cache_ops import _to_legacy, cache_reindex, clone_cache, rope_inv_freq
 
 THETA = 10000.0
 
@@ -48,9 +48,10 @@ def test_reindex_equals_encoding_at_shifted_position():
     ids = torch.randint(0, 64, (1, 6))
     p, d = 5, 7
 
+    inv = rope_inv_freq(m)
     cache_p = _cache_at(m, ids, p)
     cache_pd = _cache_at(m, ids, p + d)
-    shifted = cache_reindex(cache_p, d, rope_theta=THETA)
+    shifted = cache_reindex(cache_p, d, inv)
 
     for (ks, vs), (kb, vb) in zip(_legacy(shifted), _legacy(cache_pd)):
         assert torch.allclose(ks, kb, atol=1e-4), (ks - kb).abs().max().item()  # keys relocated
@@ -60,19 +61,20 @@ def test_reindex_equals_encoding_at_shifted_position():
 @torch.no_grad()
 def test_reindex_is_a_correct_rotation():
     m = _model()
+    inv = rope_inv_freq(m)
     cache = _cache_at(m, torch.randint(0, 64, (1, 5)), 0)
 
     # identity at delta 0
-    for (k0, _), (k, _) in zip(_legacy(cache), _legacy(cache_reindex(cache, 0, THETA))):
+    for (k0, _), (k, _) in zip(_legacy(cache), _legacy(cache_reindex(cache, 0, inv))):
         assert torch.allclose(k0, k, atol=1e-6)
 
     # composition: R(a) then R(b) == R(a+b)
-    ab = cache_reindex(cache_reindex(cache, 3, THETA), 4, THETA)
-    a_plus_b = cache_reindex(cache, 7, THETA)
+    ab = cache_reindex(cache_reindex(cache, 3, inv), 4, inv)
+    a_plus_b = cache_reindex(cache, 7, inv)
     for (k1, _), (k2, _) in zip(_legacy(ab), _legacy(a_plus_b)):
         assert torch.allclose(k1, k2, atol=1e-4)
 
     # inverse: shift by d then -d is identity
-    round_trip = cache_reindex(cache_reindex(cache, 9, THETA), -9, THETA)
+    round_trip = cache_reindex(cache_reindex(cache, 9, inv), -9, inv)
     for (k0, _), (k, _) in zip(_legacy(cache), _legacy(round_trip)):
         assert torch.allclose(k0, k, atol=1e-4)

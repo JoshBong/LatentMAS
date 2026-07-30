@@ -31,6 +31,7 @@ from pathlib import Path
 
 # arm name -> the run.py flags that define it. Everything else is common.
 ARM_FLAGS = {
+    "single":           ["--method", "baseline"],   # 1 call, full context — the arm to beat
     "baseline":         ["--method", "baseline"],
     "latent_mas":       ["--method", "latent_mas", "--prompt", "hierarchical"],
     "routed":           ["--method", "routed_mas", "--routing", "orchestrated"],
@@ -79,7 +80,9 @@ def main():
     print(f"{len(runs)} runs -> {out}\n")
 
     for i, (arm, task, seed) in enumerate(runs, 1):
-        rid = f"{arm}__{task}__seed{seed}"
+        # worker count in the id so `--num_workers 2` vs `3` don't collide
+        nw = f"__nw{args.num_workers}" if arm.startswith("routed") else ""
+        rid = f"{arm}{nw}__{task}__seed{seed}"
         rdir = out / rid
         rdir.mkdir(exist_ok=True)
         if (rdir / "summary.json").exists():

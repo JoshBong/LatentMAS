@@ -24,14 +24,13 @@ from __future__ import annotations
 
 import argparse
 import re
-import string
 from typing import Dict, List, Optional
 
 import torch
 
 from . import Agent
 from models import ModelWrapper
-from utils import normalize_answer, extract_gsm8k_answer
+from utils import answer_hit, extract_answer, extract_gsm8k_answer, normalize_answer, squad_norm, token_f1
 from prompts_routed import (
     build_orchestrator_prompt,
     build_routed_judger,
@@ -39,19 +38,14 @@ from prompts_routed import (
     build_routed_worker,
     parse_briefs,
 )
-from methods.cache_ops import cache_concat, cache_length, cache_reindex, cache_suffix, clone_cache
-
-_ARTICLES = re.compile(r"\b(a|an|the)\b")
-
-
-def _squad_norm(s: str) -> str:
-    """SQuAD/HotpotQA answer normalization: lowercase, drop punctuation and
-    articles, collapse whitespace. Used for both EM and F1 so they agree."""
-    s = (s or "").lower()
-    s = s.translate(str.maketrans("", "", string.punctuation))
-    s = _ARTICLES.sub(" ", s)
-    return " ".join(s.split())
-
+from methods.cache_ops import (
+    cache_concat,
+    cache_length,
+    cache_reindex,
+    cache_suffix,
+    clone_cache,
+    rope_inv_freq,
+)
 
 class RoutedMASMethod:
     def __init__(
@@ -77,12 +71,17 @@ class RoutedMASMethod:
         # 'orchestrated' = the lead decodes a brief per worker (route out with
         # text); 'static' = fixed contiguous doc split, generic briefs.
         self.routing = getattr(args, "routing", "orchestrated")
+        # Backstop only -- with enable_thinking=False the orchestrator hits EOS well
+        # inside this. If experiments/inspect_orchestrator.py shows truncation, raise
+        # it; a cap should never be the normal terminator.
         self.orchestrator_max_new_tokens = getattr(args, "orchestrator_max_new_tokens", 256)
         # De-entangle RoPE positions in the stitched judge cache (default on).
         self.reindex = not getattr(args, "no_reindex", False)
         hf = getattr(model, "HF_model", None) or getattr(model, "model", None)
-        cfg = getattr(hf, "config", None)
-        self.rope_theta = float(getattr(cfg, "rope_theta", 10000.0)) if cfg is not None else 10000.0
+        # Read the model's actual rotary frequencies (raises if absent) -- only
+        # when reindexing, since a wrong value corrupts the cache. --no_reindex
+        # skips this entirely.
+        self.rope_inv_freq = rope_inv_freq(hf) if self.reindex else None
 
         # Workers = the non-judger custom agents if supplied, else N generic workers.
         custom = getattr(args, "custom_agents", None)
@@ -95,46 +94,28 @@ class RoutedMASMethod:
 
     # ------------------------------------------------------------------ scoring
     def _extract(self, text: str) -> str:
-        m = re.search(r"\\boxed\{(.+?)\}", text, flags=re.DOTALL)
-        if m:
-            return m.group(1).strip()
+        # math: pull the boxed value / final number
         if self.task in ("gsm8k", "aime2024", "aime2025"):
+            m = re.search(r"\\boxed\{(.+?)\}", text, flags=re.DOTALL)
+            if m:
+                return m.group(1).strip()
             got = extract_gsm8k_answer(text)
             if got:
                 return got
-        # free-form (hotpotqa): last non-empty line
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        return lines[-1] if lines else text.strip()
+        # free-form (hotpotqa): strip <think>, take boxed / 'answer is' / first sentence
+        return extract_answer(text)
 
     def _score(self, pred_text: str, gold: str) -> tuple:
-        """Exact match after SQuAD/HotpotQA normalization (the standard EM).
-
-        No substring leniency: 'pred in gold' would score pred='a' correct
-        against gold='canada'. Partial credit lives in F1, not here.
-        """
-        pred = _squad_norm(self._extract(pred_text))
-        gold = _squad_norm(gold)
+        """The judge writes prose; math wants exact, free-form wants recall."""
+        pred = self._extract(pred_text)
         if not gold:
             return pred, False
-        return pred, (pred == gold)
-
-    @staticmethod
-    def _f1(pred: str, gold: str) -> float:
-        """HotpotQA-style token-overlap F1 between the extracted answer and gold."""
-        p = _squad_norm(pred).split()
-        g = _squad_norm(gold).split()
-        if not p or not g:
-            return float(p == g)
-        common = 0
-        gg = list(g)
-        for tok in p:
-            if tok in gg:
-                common += 1
-                gg.remove(tok)
-        if common == 0:
-            return 0.0
-        prec, rec = common / len(p), common / len(g)
-        return 2 * prec * rec / (prec + rec)
+        if self.task in ("gsm8k", "aime2024", "aime2025"):
+            ok = squad_norm(pred) == squad_norm(gold)
+        else:
+            # did the gold answer actually appear in the judge's response?
+            ok = answer_hit(pred_text, gold)
+        return pred, bool(ok)
 
     # ------------------------------------------------------------------- worker
     @torch.no_grad()
@@ -154,16 +135,25 @@ class RoutedMASMethod:
 
         # -- Phase 1b: orchestrator decodes one brief per worker (route OUT = text) --
         briefs = None
+        n_briefs_parsed = None
         if self.routing == "orchestrated":
             _, o_ids, o_mask, _ = model.prepare_chat_batch(
                 [build_orchestrator_prompt(question, self.n_workers, context_docs, self.args)],
                 add_generation_prompt=True,
+                enable_thinking=False,   # emit briefs directly; don't spend the budget thinking
             )
             o_gen, _ = model.generate_text_batch(
                 o_ids, o_mask, max_new_tokens=self.orchestrator_max_new_tokens,
                 temperature=self.temperature, top_p=self.top_p, past_key_values=None,
             )
-            briefs = parse_briefs(o_gen[0], self.n_workers)
+            briefs, n_briefs_parsed = parse_briefs(o_gen[0], self.n_workers)
+            # A cap should never be what ends this normally -- with thinking off the
+            # model reaches EOS well within budget. If it didn't, say so loudly:
+            # padded briefs make workers identical and tank divergence.
+            if n_briefs_parsed < self.n_workers:
+                print(f"[routed_mas] WARNING: orchestrator emitted {n_briefs_parsed}/"
+                      f"{self.n_workers} real briefs; {self.n_workers - n_briefs_parsed} padded "
+                      f"-> those workers won't differentiate (divergence reads low).")
 
         # -- Phase 2: fan out; each worker runs from an independent clone of S0 --
         worker_caches = []
@@ -194,7 +184,7 @@ class RoutedMASMethod:
         for S_w in worker_caches:
             suf = cache_suffix(S_w, base_len)
             if self.reindex and offset > 0:
-                suf = cache_reindex(suf, offset, rope_theta=self.rope_theta)
+                suf = cache_reindex(suf, offset, inv_freq=self.rope_inv_freq)
             suffixes.append(suf)
             offset += cache_length(suf)
         combined = cache_concat([S0] + suffixes)
@@ -209,7 +199,7 @@ class RoutedMASMethod:
         ).strip()
 
         pred, ok = self._score(final_text, item.get("gold", ""))
-        f1 = self._f1(pred, item.get("gold", ""))
+        f1 = token_f1(pred, item.get("gold", ""))
         traces.append({"name": "Judger", "role": "judger", "output": final_text})
 
         return {
@@ -223,6 +213,7 @@ class RoutedMASMethod:
             "f1": f1,
             "routing": self.routing,
             "briefs": briefs,
+            "n_briefs_parsed": n_briefs_parsed,
             "worker_divergence": self._divergence(worker_embeds),
             "n_workers": self.n_workers,
         }

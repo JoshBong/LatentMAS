@@ -82,9 +82,14 @@ class ModelWrapper:
             load_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         else:
             load_dtype = torch.float32
+        # low_cpu_mem_usage avoids the ~2x-model-size RAM spike during loading that
+        # SIGKILLs (-9) a 4B model on Colab's ~12.7GB RAM. The print surfaces whether
+        # CUDA is actually active -- fp32 on a CPU runtime is the other way to OOM.
+        print(f"[ModelWrapper] loading {model_name} | cuda={torch.cuda.is_available()} "
+              f"| dtype={load_dtype} | device={device}", flush=True)
         with torch.no_grad():
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_name, torch_dtype=load_dtype,
+                model_name, torch_dtype=load_dtype, low_cpu_mem_usage=True,
             )
         if len(self.tokenizer) != self.model.get_input_embeddings().weight.shape[0]:
             self.model.resize_token_embeddings(len(self.tokenizer))
@@ -95,12 +100,19 @@ class ModelWrapper:
         if self.latent_space_realign:
             self._ensure_latent_realign_matrix(self.model, self.device, args)
 
-    def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True) -> str:
+    def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True,
+                    enable_thinking: bool = True) -> str:
         tpl = getattr(self.tokenizer, "chat_template", None)
         if tpl:
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=add_generation_prompt
-            )
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=add_generation_prompt,
+                    enable_thinking=enable_thinking,
+                )
+            except TypeError:   # template that doesn't accept the kwarg
+                return self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=add_generation_prompt
+                )
         segments = []
         for message in messages:
             role = message.get("role", "user")
@@ -129,10 +141,13 @@ class ModelWrapper:
         self,
         batch_messages: List[List[Dict]],
         add_generation_prompt: bool = True,
+        enable_thinking: bool = True,
     ) -> Tuple[List[str], torch.Tensor, torch.Tensor, List[List[str]]]:
         prompts: List[str] = []
         for messages in batch_messages:
-            prompts.append(self.render_chat(messages, add_generation_prompt=add_generation_prompt))
+            prompts.append(self.render_chat(
+                messages, add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking))
         encoded = self.tokenizer(
             prompts,
             return_tensors="pt",

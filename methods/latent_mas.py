@@ -295,12 +295,19 @@ class LatentMASMethod:
                     ok = False
                     error_msg = f'Value error in parsing answer. Pred: {pred}, Gold: {gold}'
 
+            elif self.task == "hotpotqa":
+                # free-form: judge writes prose; extract + recall-match (same as routed)
+                from utils import answer_hit, extract_answer
+                gold = item.get("gold", "")
+                pred = extract_answer(final_text)
+                ok = answer_hit(final_text, gold) if gold else False
+                error_msg = None
             else:
                 pred = normalize_answer(extract_gsm8k_answer(final_text))
                 gold = item.get("gold", "")
                 ok = (pred == gold) if (pred and gold) else False
                 error_msg = None
-            
+
             results.append(
                 {
                     "question": item["question"],
