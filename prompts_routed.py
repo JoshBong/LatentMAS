@@ -54,27 +54,41 @@ ORCHESTRATOR_SYSTEM = (
 
 def build_orchestrator_prompt(question: str, n_workers: int,
                               context_docs: Optional[List[str]] = None, args=None) -> List[dict]:
-    """The lead's decode: read the question, emit one brief per worker (as TEXT).
+    """The lead's decode: read the question, emit one brief per worker (as TEXT),
+    AND -- when documents are present -- which numbered sources that worker should
+    read. Routing the EVIDENCE (not just the brief) is what stops a worker being
+    handed a blind index-slice that has nothing to do with its subtask.
 
     This is the 'route out with text' half -- the routing decision is discrete,
     so it is language. The workers' findings come back as latent state.
     """
     titles = ""
+    docs_fmt = ""
+    docs_rule = ""
     if context_docs:
         heads = [d.split(":", 1)[0][:80] for d in context_docs]
-        titles = "\n\nAvailable source topics:\n" + "\n".join(f"- {t}" for t in heads)
+        titles = "\n\nAvailable sources (cite by number):\n" + "\n".join(
+            f"[{i + 1}] {t}" for i, t in enumerate(heads))
+        docs_fmt = " [docs: <source numbers>]"
+        docs_rule = ("\nAssign each source to the ONE worker whose subtask it answers "
+                     "(a source goes to at most one worker); list its number(s) in that "
+                     "worker's [docs: ...] tag. Every relevant source must be assigned.")
     user = f"""Question: {question}{titles}
 
 Assign one focused subtask to each of {n_workers} workers. Make them cover
 different parts of the question / different sources -- do NOT give overlapping work.
-Keep each subtask to ONE concise sentence (under 20 words).
+Keep each subtask to ONE concise sentence (under 20 words).{docs_rule}
 
 Output EXACTLY {n_workers} lines, no more, in this format:
-Worker 1: <subtask>
-Worker 2: <subtask>
+Worker 1: <subtask>{docs_fmt}
+Worker 2: <subtask>{docs_fmt}
 ...
-Worker {n_workers}: <subtask>"""
+Worker {n_workers}: <subtask>{docs_fmt}"""
     return _msgs(ORCHESTRATOR_SYSTEM, user)
+
+
+_WORKER_LINE_RE = re.compile(r"(?im)^\s*worker\s*\d+\s*[:\-.)]\s*(.+?)\s*$")
+_DOCS_TAG_RE = re.compile(r"\[docs?:\s*([\d,\s]+)\]\s*$", re.IGNORECASE)
 
 
 def parse_briefs(text: str, n_workers: int):
@@ -85,10 +99,14 @@ def parse_briefs(text: str, n_workers: int):
     is padded with a generic brief here, and padded briefs make workers near-
     identical -> divergence collapses -> looks like 'routing doesn't help' when
     the real problem is the orchestrator prompt. Truncates on over-production.
+
+    A trailing `[docs: ...]` routing tag is stripped from the brief text (it is
+    parsed separately by parse_doc_assignments), so the brief stays clean prose.
     """
     found: List[str] = []
-    for m in re.finditer(r"(?im)^\s*worker\s*\d+\s*[:\-.)]\s*(.+?)\s*$", text):
-        found.append(m.group(1).strip())
+    for m in _WORKER_LINE_RE.finditer(text):
+        line = _DOCS_TAG_RE.sub("", m.group(1)).strip()
+        found.append(line)
     n_matched = len(found)
     briefs = found[:n_workers]
     while len(briefs) < n_workers:
@@ -96,15 +114,45 @@ def parse_briefs(text: str, n_workers: int):
     return briefs, n_matched
 
 
+def parse_doc_assignments(text: str, n_workers: int, n_docs: int):
+    """Per-worker 0-based doc indices, parsed from each line's trailing [docs: i,j].
+
+    Returns a list of length n_workers. Entry w is a (possibly empty) sorted list
+    of valid 0-based doc indices if that worker's line carried a [docs: ...] tag,
+    else None -- meaning the orchestrator gave no explicit routing for that worker
+    and the caller should fall back to the contiguous slice. Out-of-range and
+    non-numeric tokens are dropped. This is the fix for the brief<->evidence
+    mismatch: the orchestrator, not a blind index split, decides what each worker
+    sees, so its subtask and its documents actually line up.
+    """
+    assigns: List[Optional[List[int]]] = [None] * n_workers
+    w = 0
+    for m in _WORKER_LINE_RE.finditer(text):
+        if w >= n_workers:
+            break
+        tag = _DOCS_TAG_RE.search(m.group(1))
+        if tag:
+            idxs = []
+            for tok in tag.group(1).split(","):
+                tok = tok.strip()
+                if tok.isdigit():
+                    i = int(tok) - 1                      # orchestrator numbers 1-based
+                    if 0 <= i < n_docs:
+                        idxs.append(i)
+            assigns[w] = sorted(set(idxs))
+        w += 1
+    return assigns
+
+
 def build_routed_worker(
     question: str,
     w_idx: int,
     n_workers: int,
-    context_docs: Optional[List[str]] = None,
+    docs: Optional[List[str]] = None,
     brief: Optional[str] = None,
     args=None,
 ) -> List[dict]:
-    docs = worker_doc_slice(context_docs, w_idx, n_workers)
+    docs = docs or []
     system = (
         f"You are Worker {w_idx + 1} of {n_workers} on a team solving a question. "
         f"Focus ONLY on your assigned subtask and material; other workers cover the rest."
@@ -136,7 +184,11 @@ combine everyone's findings."""
     return _msgs(system, user)
 
 
-def build_routed_judger(question: str, args=None) -> List[dict]:
+def build_routed_judger(question: str, args=None, blind: bool = False) -> List[dict]:
+    """Judge prompt. `blind` (the judge_blind kill-switch) withholds the question
+    text so the judge must recover the task from the latent findings alone -- if it
+    still answers, the latent channel is genuinely carrying the load, not the
+    restated question."""
     system = "You are the judge. Combine the workers' latent findings into a final answer."
     task = getattr(args, "task", None)
     if task in ("gsm8k", "aime2024", "aime2025"):
@@ -146,7 +198,13 @@ def build_routed_judger(question: str, args=None) -> List[dict]:
     else:  # hotpotqa and free-form
         fmt = ("Give the shortest exact answer (a name, entity, number, or yes/no) "
                "inside \\boxed{YOUR_FINAL_ANSWER}.")
-    user = f"""Target Question: {question}
+    header = (
+        "The question is NOT restated -- recover what is being asked from the latent\n"
+        "findings themselves."
+        if blind
+        else f"Target Question: {question}"
+    )
+    user = f"""{header}
 
 You are given latent findings from several workers, each of whom saw part of the
 material. The findings may be partial or contain irrelevant content -- use what

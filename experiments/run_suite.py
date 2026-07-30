@@ -37,6 +37,12 @@ ARM_FLAGS = {
     "routed":           ["--method", "routed_mas", "--routing", "orchestrated"],
     "routed_static":    ["--method", "routed_mas", "--routing", "static"],
     "routed_noreindex": ["--method", "routed_mas", "--routing", "orchestrated", "--no_reindex"],
+    # Kill-switch controls -- run these at n=50 BEFORE the full matrix. If
+    # empty_cache ties routed, stop and fix the judge; if routed ~= noise_blocks,
+    # publish the negative result (the workers aren't contributing).
+    "judge_blind":      ["--method", "routed_mas", "--routing", "orchestrated", "--arm", "judge_blind"],
+    "empty_cache":      ["--method", "routed_mas", "--routing", "orchestrated", "--arm", "empty_cache"],
+    "noise_blocks":     ["--method", "routed_mas", "--routing", "orchestrated", "--arm", "noise_blocks"],
 }
 
 

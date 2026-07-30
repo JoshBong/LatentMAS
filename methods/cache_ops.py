@@ -148,6 +148,27 @@ def cache_reindex(cache, delta: int, inv_freq):
     return _from_legacy(out, cache)
 
 
+def noise_cache(cache):
+    """Replace every layer's K and V with Gaussian noise of the SAME shape and the
+    SAME per-layer Frobenius norm, content destroyed.
+
+    For the `noise_blocks` kill-switch: stitch shape/norm-matched noise into the
+    judge in place of the real worker suffixes (re-indexed identically by the
+    caller, so ONLY the information is removed, not the positional bookkeeping). If
+    the judge scores the same on noise as on real states, the latent channel is
+    carrying nothing -- publish the negative result.
+    """
+    legacy = _to_legacy(cache)
+    out = []
+    for (k, v) in legacy:
+        nk = torch.randn_like(k)
+        nv = torch.randn_like(v)
+        nk = nk * (k.norm() / (nk.norm() + 1e-8))       # match this layer's K norm
+        nv = nv * (v.norm() / (nv.norm() + 1e-8))       # match this layer's V norm
+        out.append((nk, nv))
+    return _from_legacy(tuple(out), cache)
+
+
 def cache_concat(caches: Sequence):
     """Concatenate several caches along the sequence axis, layer by layer.
 
