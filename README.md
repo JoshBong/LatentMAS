@@ -13,7 +13,7 @@
 
 <p align="center">
     <a href="https://arxiv.org/abs/2511.20639"><img src="https://img.shields.io/badge/Base-LatentMAS%20(2511.20639)-B31B1B.svg?logo=arxiv" alt="Base paper"></a>
-    <a href="./HANDOFF.md"><img src="https://img.shields.io/badge/Status-research%20fork-informational.svg" alt="Status"></a>
+    <img src="https://img.shields.io/badge/Status-research%20fork-informational.svg" alt="Status">
 </p>
 
 ---
@@ -86,7 +86,6 @@ LatentMAS/
 │── data.py                # loaders (incl. load_hotpotqa)
 │── experiments/           # [fork] probe_router · run_suite · analyze · inspect_orchestrator
 │── tests/                 # [fork] 26 tests (cache ops, RoPE reindex, router)
-│── HANDOFF.md             # [fork] current state
 ```
 
 ## 🌐 Related Works based on LatentMAS
