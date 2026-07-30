@@ -1,111 +1,41 @@
-<a name="readme-top"></a>
+# Routed LatentMAS
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo.png">
-    <img alt="Routed LatentMAS" src="assets/logo.png" width=500>
-  </picture>
-</p>
+A fork of [LatentMAS](https://github.com/Gen-Verse/LatentMAS) that adds **routed fan-out**: instead of every agent working from the same context, a lead agent splits the task and gives each worker a different slice, runs them in parallel, and combines their results for a final answer — all through the models' KV caches, never through text.
 
-# ⚡️ Routed LatentMAS (Fork)
+## How agents communicate through the KV cache
 
-> **Fork of [LatentMAS](https://github.com/Gen-Verse/LatentMAS).** Adds a **routed** latent multi-agent method: a lead decomposes a task, workers reason **in parallel over disjoint context**, and a judge synthesizes over their combined KV cache.
+When a transformer reads text, it builds a **key/value (KV) cache**: the stored attention state for every token it has processed. This is the model's working memory of the context. LatentMAS's core idea is that agents can hand this cache to each other directly instead of writing and re-reading text — agent B is given agent A's KV cache and attends to it as if it had read A's context itself. No serialization to text, no re-reading; the reasoning stays in latent space.
 
-<p align="center">
-    <a href="https://arxiv.org/abs/2511.20639"><img src="https://img.shields.io/badge/Base-LatentMAS%20(2511.20639)-B31B1B.svg?logo=arxiv" alt="Base paper"></a>
-    <img src="https://img.shields.io/badge/Status-research%20fork-informational.svg" alt="Status">
-</p>
+Base LatentMAS threads a **single** KV cache down a fixed chain of agents. Each agent inherits everything the previous ones accumulated, so they all reason from the same, growing context.
 
----
+## What this fork changes
 
-## 🌟 What's New: Routed Fan-Out
+Routed LatentMAS gives each worker only the part of the context it needs:
 
-The base LatentMAS gives every agent the **same** context (a sequential chain, or several perspectives on the same question). **Routed LatentMAS gives each worker a different, disjoint slice** — the **orchestrator-worker** pattern: lead decomposes → workers run in parallel on non-overlapping context → judge combines.
+1. **Lead** reads the shared context once, producing a base KV cache `S0`.
+2. **Fan out** — each worker gets its own copy of `S0` plus a different sub-task, and runs **in parallel**. The workers never see each other. Each one produces a small KV block: its reasoning over its own slice.
+3. **Append the caches** — the workers' KV blocks are concatenated onto `S0` into one combined cache, and a **judge** decodes the final answer over the whole thing at once. The judge attends to every worker's latent work simultaneously, without re-reading any text.
 
-> **The idea:** split by **CONTEXT**, not by **ROLE**.
+This turns the chain into a genuine parallel decomposition — the latent analogue of map-reduce: workers map over disjoint slices, the judge reduces. It only makes sense for tasks that actually split (e.g. comparison questions over two separate entities), which is what the fork targets.
 
-**How it works** (`methods/routed_mas.py` + `methods/cache_ops.py`, all at the KV-cache level):
+## Why appending the caches takes care
 
-1. **Lead** reads the shared context once → base cache `S0`.
-2. **Fan out** — each worker gets an independent `clone_cache(S0)` + its own brief, runs in parallel, produces a suffix KV block.
-3. **Stitch** — `cache_concat([S0] + suffixes)` with RoPE re-indexing so the blocks sit at correct positions.
-4. **Judge** decodes the final answer over the stitched cache.
+Each worker built its cache starting right after `S0`, so every worker's tokens think they live at the same positions. Concatenate them naively and those positions collide — the judge's attention reads them out of order and the answer is garbage.
+
+So before appending, each worker's block is **re-indexed**: its rotary position encoding (RoPE) is re-rotated to the block's real offset in the combined sequence. This is a cheap, exact rotation — no recomputation — and it makes the concatenation read as one correctly-ordered sequence. (`--no_reindex` turns it off, to measure that it matters.)
+
+## Running it
 
 ```bash
-python run.py --method routed_mas --model_name Qwen/Qwen3-1.7B --task hotpotqa \
-  --num_workers 2 --routing orchestrated --latent_steps 10
-```
-
-`--routing orchestrated` = lead decodes a brief per worker · `--routing static` = fixed doc split.
-
----
-
-## 🛠️ Getting Started
-
-```bash
-conda create -n latentmas python=3.10 -y
-conda activate latentmas
+git clone -b routed-mas https://github.com/JoshBong/LatentMAS.git && cd LatentMAS
 pip install -r requirements.txt
 
-git clone -b routed-mas https://github.com/JoshBong/LatentMAS.git
-cd LatentMAS
+# routed fan-out on comparison questions (2 disjoint entities -> 2 workers)
+python run.py --method routed_mas --model_name Qwen/Qwen3-4B --task hotpotqa --num_workers 2
 ```
 
-Optionally set your HF cache: `export HF_HOME=/path/to/huggingface`.
+For comparison: `--method baseline` (one agent, full context) and `--method latent_mas` (the base chain).
 
-## 🧪 Running Experiments
+## Credit
 
-```bash
-# Baseline (single model)
-python run.py --method baseline  --model_name Qwen/Qwen3-14B --task gsm8k --max_samples -1
-
-# TextMAS (token-space multi-agent)
-python run.py --method text_mas  --model_name Qwen/Qwen3-14B --task gsm8k --prompt sequential --max_samples -1
-
-# LatentMAS (base latent multi-agent)
-python run.py --method latent_mas --model_name Qwen/Qwen3-14B --task gsm8k --prompt sequential --latent_steps 10
-
-# Routed LatentMAS (this fork)
-python run.py --method routed_mas --model_name Qwen/Qwen3-1.7B --task hotpotqa --num_workers 2 --routing orchestrated --latent_steps 10
-```
-
-Inherited from the base: `--latent_steps ∈ [0,80]`, `--latent_space_realign`, custom agents via `--custom_prompt_file`, `--do_not_enforce_qwen` for non-Qwen models, and the hybrid HF+vLLM path (`--use_vllm`).
-
-## 📦 Repository Structure
-
-```
-LatentMAS/
-│── run.py                 # Main entry
-│── models.py              # HF + vLLM wrapper + latent realignment
-│── methods/
-│   ├── baseline.py · text_mas.py · latent_mas.py   # base methods
-│   ├── routed_mas.py      # [fork] lead → clone-per-worker → stitch → judge
-│   ├── router.py          # [fork] decompose step (units + per-worker specs)
-│   └── cache_ops.py       # [fork] KV surgery: clone / concat / RoPE re-index
-│── prompts_routed.py      # [fork] orchestrator / worker / judge prompts
-│── data.py                # loaders (incl. load_hotpotqa)
-│── experiments/           # [fork] probe_router · run_suite · analyze · inspect_orchestrator
-│── tests/                 # [fork] 26 tests (cache ops, RoPE reindex, router)
-```
-
-## 🌐 Related Works based on LatentMAS
-
-- **KNN-LatentMAS** ([Bookmaster9](https://github.com/Bookmaster9/kNN-latentMAS)) — kNN prune of the shared KV cache.
-- **Hybrid-LatentMAS** ([nhminle](https://github.com/nhminle/LatentMAS-Hybrid)) — heterogeneous models via cross-vocab alignment.
-- **LatentMAS-SLoRA** ([Arifuzzamanjoy](https://github.com/Arifuzzamanjoy/latent_mas_slora)) — per-role LoRA adapters + domain router.
-- **Routed LatentMAS** (this fork) — routes *context*: parallel workers over disjoint slices → judge.
-
-## 📚 Citation
-
-```bibtex
-@article{zou2025latentmas,
-  title={Latent Collaboration in Multi-Agent Systems},
-  author={Zou, Jiaru and Yang, Xiyuan and Qiu, Ruizhong and Li, Gaotang and Tieu, Katherine and Lu, Pan and Shen, Ke and Tong, Hanghang and Choi, Yejin and He, Jingrui and Zou, James and Wang, Mengdi and Yang, Ling},
-  journal={arXiv preprint arXiv:2511.20639},
-  year={2025}
-}
-```
-
-## 🤝 Acknowledgement
-
-Research fork of **[LatentMAS](https://github.com/Gen-Verse/LatentMAS)** (Zou et al., 2025), built on its Science-LatentMAS branch, partially based on **[vLLM](https://github.com/vllm-project/vllm)**. The routed method, cache-surgery ops, and router are additions of this fork.
+Fork of [LatentMAS](https://github.com/Gen-Verse/LatentMAS) (Zou et al., 2025), *Latent Collaboration in Multi-Agent Systems*, [arXiv:2511.20639](https://arxiv.org/abs/2511.20639). The routed method, KV-cache operations, and router are additions of this fork.
