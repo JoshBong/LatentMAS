@@ -86,8 +86,9 @@ def main():
     print(f"{len(runs)} runs -> {out}\n")
 
     for i, (arm, task, seed) in enumerate(runs, 1):
-        # worker count in the id so `--num_workers 2` vs `3` don't collide
-        nw = f"__nw{args.num_workers}" if arm.startswith("routed") else ""
+        # worker count in the id so `--num_workers 2` vs `3` don't collide (every
+        # routed_mas arm uses workers, incl. the kill-switch ablations)
+        nw = f"__nw{args.num_workers}" if "routed_mas" in ARM_FLAGS[arm] else ""
         rid = f"{arm}{nw}__{task}__seed{seed}"
         rdir = out / rid
         rdir.mkdir(exist_ok=True)
