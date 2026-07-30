@@ -101,7 +101,10 @@ class ModelWrapper:
             self._ensure_latent_realign_matrix(self.model, self.device, args)
 
     def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True,
-                    enable_thinking: bool = True) -> str:
+                    enable_thinking: bool = False) -> str:
+        # Default OFF: short-answer QA (HotpotQA/GSM8K) doesn't need text <think>,
+        # and thinking blocks eat the generation budget before the answer is emitted.
+        # The LATENT reasoning (latent_steps) is a separate mechanism and is unaffected.
         tpl = getattr(self.tokenizer, "chat_template", None)
         if tpl:
             try:
@@ -141,7 +144,7 @@ class ModelWrapper:
         self,
         batch_messages: List[List[Dict]],
         add_generation_prompt: bool = True,
-        enable_thinking: bool = True,
+        enable_thinking: bool = False,   # default OFF — see render_chat
     ) -> Tuple[List[str], torch.Tensor, torch.Tensor, List[List[str]]]:
         prompts: List[str] = []
         for messages in batch_messages:
