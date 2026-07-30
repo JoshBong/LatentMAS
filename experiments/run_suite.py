@@ -31,6 +31,7 @@ from pathlib import Path
 
 # arm name -> the run.py flags that define it. Everything else is common.
 ARM_FLAGS = {
+    "single":           ["--method", "baseline"],   # 1 call, full context — the arm to beat
     "baseline":         ["--method", "baseline"],
     "latent_mas":       ["--method", "latent_mas", "--prompt", "hierarchical"],
     "routed":           ["--method", "routed_mas", "--routing", "orchestrated"],
