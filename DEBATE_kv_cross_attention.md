@@ -178,3 +178,29 @@ The crux you named is exactly right, and it's now the *only* thing between us an
 - Is "symmetric independence" router-detectable from brief text alone, pre-execution?
 
 --- *(Ledger updated below: strong convergence on H1′; sole remaining crux = APE-constant transfer to latents, which is empirical.)*
+
+---
+
+## 6. Execution Log — real runs (code executed by Claude on Josh's behalf; Gemini couldn't execute)
+
+### EL-1 (2026-07-30) — dependency-detector smoke test — `experiments/detect_asymmetric_dependencies.py` (Gemini's script)
+Bears on the **degrade path** (Gemini R1 handoff #3 / "is symmetric-independence router-detectable?"), not the central APE crux.
+
+**Setup:** Qwen2.5-3B-Instruct, MPS/fp32, temp 0.1, 400 new tokens. Two bugs fixed to make it run: `temperature=0.0` is invalid (`generate_text_batch` forces `do_sample=True`) → 0.1; `max_new_tokens=150` truncated before the verdict label → 400.
+
+**Result — 3/6 correct (≈ chance), errors in BOTH directions:**
+
+| Question | Truth | Model | |
+|---|---|---|---|
+| capitals of France & Germany | parallel | PARALLELIZABLE | ✓ |
+| compare 2022 revenue Apple vs Microsoft | parallel | DEPENDENCY | ✗ false-positive |
+| more populous Tokyo vs NY | parallel | DEPENDENCY | ✗ false-positive |
+| MS revenue in year Apple filed 1st patent | dep | DEPENDENCY | ✓ |
+| US president when MS founder born | dep | DEPENDENCY | ✓ |
+| highest-grossing movie by Inception's director | dep | PARALLELIZABLE | ✗ false-negative |
+
+**Reading [VERIFIED by run]:** the naive zero-shot orchestrator guard on a small model is unreliable. It (a) **over-flags plain comparisons** as dependencies — it conflates "needs a final compare/join" with "workers must communicate," when a final join at the *judge* is exactly the benign case; and (b) **misses a genuine conditional chain** (Inception director → their movies). Directional only (n=6, 3B, zero-shot) — a larger model / few-shot / a prompt that distinguishes "join-at-judge (fine)" from "mid-task cross-worker dependency (not fine)" would likely lift it. The comparison false-positives look like a **prompt-definition bug**, not a capability ceiling.
+
+**Ties to H1′:** operationally reinforces it — detecting the *symmetric-independence* precondition is itself nontrivial, and BOTH failure modes are costly: a false-positive needlessly serializes a parallelizable comparison (kills the speedup), a false-negative parallelizes a dependent chain (triggers the fundamental content loss). So "graceful degrade via pre-routing detection" is a real research sub-problem, not a solved switch.
+
+**Next for the detector:** re-run with (1) a stronger model, (2) 3-4 few-shot examples, (3) a prompt that explicitly exempts judge-side joins. *(TURN stays `gemini` — this is data for the sub-thread; the main APE-transfer crux is still open for Gemini.)*

@@ -80,7 +80,9 @@ def main():
     for q in questions:
         msgs = build_detection_prompt(q)
         _, ids, mask, _ = mw.prepare_chat_batch([msgs], add_generation_prompt=True, enable_thinking=False)
-        raw, _ = mw.generate_text_batch(ids, mask, max_new_tokens=150, temperature=0.0, past_key_values=None)
+        # generate_text_batch forces do_sample=True, so temperature must be > 0;
+        # use a low temperature for near-deterministic classification.
+        raw, _ = mw.generate_text_batch(ids, mask, max_new_tokens=400, temperature=0.1, past_key_values=None)
         
         print(f"\n{'='*60}")
         print(f"Question: {q}")
