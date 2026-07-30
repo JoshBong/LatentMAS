@@ -56,7 +56,9 @@ def process_batch(
         preds.append(res)
         if args.log_file:
             keep = ("question", "gold", "prediction", "raw_prediction", "correct", "f1",
-                    "routing", "worker_divergence", "n_workers", "n_briefs_parsed", "briefs")
+                    "routing", "arm", "worker_divergence", "n_workers", "n_briefs_parsed",
+                    "briefs", "doc_assign", "latent_steps", "prompt_tokens", "gen_tokens",
+                    "latent_tokens")
             with open(args.log_file, "a", encoding="utf-8") as lf:
                 lf.write(json.dumps({k: res.get(k) for k in keep}, ensure_ascii=False) + "\n")
         problem_idx = batch_start + offset + 1
@@ -106,6 +108,11 @@ def main():
                         help="routed_mas: 'orchestrated' = lead decodes a brief per worker (text out); 'static' = fixed doc split")
     parser.add_argument("--no_reindex", action="store_true",
                         help="routed_mas: disable RoPE re-indexing of the stitched judge cache (for A/B on whether it matters)")
+    parser.add_argument("--arm", choices=["normal", "judge_blind", "empty_cache", "noise_blocks"],
+                        default="normal",
+                        help="routed_mas kill-switch ablation: normal | judge_blind (question not "
+                             "restated) | empty_cache (workers dropped, S0 only) | noise_blocks "
+                             "(worker suffixes replaced by shape/norm-matched noise)")
     parser.add_argument("--log_file", type=str, default=None,
                         help="Append per-item results as JSONL (prediction/correct/f1/worker_divergence/briefs)")
     parser.add_argument("--prompt", type=str, choices=["sequential", "hierarchical"], default="sequential")
@@ -321,6 +328,24 @@ def main():
     if args.method == "routed_mas":
         summary["routing"] = args.routing
         summary["reindex"] = not args.no_reindex
+        summary["arm"] = args.arm
+        # Mechanism-on assertion, surfaced in the summary itself: latent_steps_min
+        # of 0 would mean the latent channel was OFF for some item (the ctor now
+        # forbids latent_steps<=0, so this is a belt-and-suspenders record).
+        lsteps = [p.get("latent_steps") for p in preds if p.get("latent_steps") is not None]
+        if lsteps:
+            summary["latent_steps"] = lsteps[0]
+            summary["latent_steps_min"] = min(lsteps)
+        nb = [p.get("n_briefs_parsed") for p in preds if p.get("n_briefs_parsed") is not None]
+        if nb:
+            summary["n_briefs_parsed_min"] = min(nb)
+            summary["n_briefs_parsed_mean"] = round(sum(nb) / len(nb), 2)
+        # Token accounting -> can finally speak to the parent's 50-80% reduction claim.
+        for key in ("prompt_tokens", "gen_tokens", "latent_tokens"):
+            vals = [p.get(key) for p in preds if p.get(key) is not None]
+            if vals:
+                summary[f"total_{key}"] = sum(vals)
+                summary[f"mean_{key}"] = round(sum(vals) / len(vals), 2)
     if f1s:
         summary["mean_f1"] = round(sum(f1s) / len(f1s), 4)
     if divs:

@@ -37,6 +37,12 @@ ARM_FLAGS = {
     "routed":           ["--method", "routed_mas", "--routing", "orchestrated"],
     "routed_static":    ["--method", "routed_mas", "--routing", "static"],
     "routed_noreindex": ["--method", "routed_mas", "--routing", "orchestrated", "--no_reindex"],
+    # Kill-switch controls -- run these at n=50 BEFORE the full matrix. If
+    # empty_cache ties routed, stop and fix the judge; if routed ~= noise_blocks,
+    # publish the negative result (the workers aren't contributing).
+    "judge_blind":      ["--method", "routed_mas", "--routing", "orchestrated", "--arm", "judge_blind"],
+    "empty_cache":      ["--method", "routed_mas", "--routing", "orchestrated", "--arm", "empty_cache"],
+    "noise_blocks":     ["--method", "routed_mas", "--routing", "orchestrated", "--arm", "noise_blocks"],
 }
 
 
@@ -80,8 +86,9 @@ def main():
     print(f"{len(runs)} runs -> {out}\n")
 
     for i, (arm, task, seed) in enumerate(runs, 1):
-        # worker count in the id so `--num_workers 2` vs `3` don't collide
-        nw = f"__nw{args.num_workers}" if arm.startswith("routed") else ""
+        # worker count in the id so `--num_workers 2` vs `3` don't collide (every
+        # routed_mas arm uses workers, incl. the kill-switch ablations)
+        nw = f"__nw{args.num_workers}" if "routed_mas" in ARM_FLAGS[arm] else ""
         rid = f"{arm}{nw}__{task}__seed{seed}"
         rdir = out / rid
         rdir.mkdir(exist_ok=True)

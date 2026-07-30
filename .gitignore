@@ -1,9 +1,18 @@
-**/__pycache__/*.venv/
+# python
 __pycache__/
 *.pyc
 .venv/
-__pycache__/
-*.pyc
+.venv*/
+
+# os
 .DS_Store
+
+# experiment outputs / scratch
 results/
-.venv5/
+*.jsonl
+probe_trials.jsonl
+
+# internal working notes (kept locally, not for the public repo)
+HANDOFF.md
+DEBATE_kv_cross_attention.md
+ROUTING_EXPERIMENT.md

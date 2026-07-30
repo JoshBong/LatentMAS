@@ -71,16 +71,17 @@ class _FakeWrapper:
 
 
 class _Args:
-    def __init__(self, routing="orchestrated"):
+    def __init__(self, routing="orchestrated", arm="normal"):
         self.task = "hotpotqa"
         self.custom_agents = None
         self.routing = routing
+        self.arm = arm
         self.no_reindex = True          # GPT-2 has no RoPE; reindex is tested separately on Llama
 
 
 def test_orchestrated_pipeline_runs_end_to_end():
     method = RoutedMASMethod(
-        _FakeWrapper(), latent_steps=0, judger_max_new_tokens=4,
+        _FakeWrapper(), latent_steps=1, judger_max_new_tokens=4,
         num_workers=3, args=_Args("orchestrated"),
     )
     res = method.run_item({
@@ -90,21 +91,54 @@ def test_orchestrated_pipeline_runs_end_to_end():
     })
     assert res["n_workers"] == 3
     assert res["routing"] == "orchestrated"
+    assert res["arm"] == "normal"
     assert res["prediction"].lower() == "paris" and res["correct"] is True   # stubbed decode
     assert isinstance(res["f1"], float)
     assert res["briefs"] is not None and len(res["briefs"]) == 3     # lead's briefs parsed + kept
     assert isinstance(res["worker_divergence"], float)
     assert len(res["agents"]) == 4                                   # 3 workers + judger
+    # token accounting is populated
+    assert res["prompt_tokens"] > 0 and res["latent_tokens"] == 3    # 1 latent step x 3 workers
+
+
+def test_latent_steps_zero_is_rejected():
+    # The mechanism can't be silently off: the ctor must refuse latent_steps<=0.
+    import pytest
+    with pytest.raises(ValueError):
+        RoutedMASMethod(_FakeWrapper(), latent_steps=0, num_workers=2, args=_Args("orchestrated"))
+
+
+def test_empty_cache_arm_drops_workers():
+    method = RoutedMASMethod(
+        _FakeWrapper(), latent_steps=1, judger_max_new_tokens=4,
+        num_workers=3, args=_Args("orchestrated", arm="empty_cache"),
+    )
+    res = method.run_item({"question": "q", "context_docs": ["a", "b", "c"], "gold": "z"})
+    assert res["arm"] == "empty_cache"
+    assert len(res["agents"]) == 1                                  # judger only, no workers
+    assert res["latent_tokens"] == 0                                # workers dropped
+    assert res["briefs"] is None                                    # orchestrator skipped
+    assert res["worker_divergence"] is None
+
+
+def test_noise_blocks_arm_runs():
+    method = RoutedMASMethod(
+        _FakeWrapper(), latent_steps=1, judger_max_new_tokens=4,
+        num_workers=3, args=_Args("orchestrated", arm="noise_blocks"),
+    )
+    res = method.run_item({"question": "q", "context_docs": ["a", "b", "c"], "gold": "z"})
+    assert res["arm"] == "noise_blocks"
+    assert len(res["agents"]) == 4                                  # workers still run, suffixes noised
 
 
 def test_static_routing_has_no_briefs():
-    method = RoutedMASMethod(_FakeWrapper(), latent_steps=0, num_workers=2, args=_Args("static"))
+    method = RoutedMASMethod(_FakeWrapper(), latent_steps=1, num_workers=2, args=_Args("static"))
     res = method.run_item({"question": "q", "context_docs": ["a", "b"], "gold": "z"})
     assert res["routing"] == "static"
     assert res["briefs"] is None                                    # static -> no lead decode
 
 
 def test_divergence_none_for_single_worker():
-    method = RoutedMASMethod(_FakeWrapper(), latent_steps=0, num_workers=1, args=_Args("static"))
+    method = RoutedMASMethod(_FakeWrapper(), latent_steps=1, num_workers=1, args=_Args("static"))
     res = method.run_item({"question": "q", "context_docs": ["a", "b"], "gold": "z"})
     assert res["worker_divergence"] is None                         # needs >=2 workers
