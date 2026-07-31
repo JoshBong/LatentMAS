@@ -2,6 +2,10 @@
 
 A fork of [LatentMAS](https://github.com/Gen-Verse/LatentMAS) that adds **routed fan-out**: instead of every agent working from the same context, a lead agent splits the task and gives each worker a different slice, runs them in parallel, and combines their results for a final answer — all through the models' KV caches, never through text.
 
+<p align="center">
+  <img alt="Routed Latent Collaboration architecture" src="assets/routed-latentmas.png" width="900">
+</p>
+
 ## How agents communicate through the KV cache
 
 When a transformer reads text, it builds a **key/value (KV) cache**: the stored attention state for every token it has processed. This is the model's working memory of the context. LatentMAS's core idea is that agents can hand this cache to each other directly instead of writing and re-reading text — agent B is given agent A's KV cache and attends to it as if it had read A's context itself. No serialization to text, no re-reading; the reasoning stays in latent space.
