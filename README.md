@@ -32,7 +32,17 @@ This turns the chain into a genuine parallel decomposition — the latent analog
 
 Each worker built its cache starting right after `S0`, so every worker's tokens think they live at the same positions. Concatenate them naively and those positions collide — the judge's attention reads them out of order and the answer is garbage.
 
-So before appending, each worker's block is **re-indexed**: its rotary position encoding (RoPE) is re-rotated to the block's real offset in the combined sequence. This is a cheap, exact rotation — no recomputation — and it makes the concatenation read as one correctly-ordered sequence. (`--no_reindex` turns it off, to measure that it matters.)
+So before appending, each worker's block is **re-indexed**: its rotary position encoding (RoPE) is re-rotated to the block's real offset in the combined sequence. This is a cheap, exact rotation — no recomputation — and it makes the concatenation read as one correctly-ordered sequence.
+
+**The formula.** RoPE encodes a key's position by rotating it: a key first computed at position $p$ is stored as $R(p)\,k_0$, where $R(p)$ is the rotary rotation for that position. Rotations of this form compose additively, so
+
+$$R(\Delta)\,R(p)\,k_0 = R(p+\Delta)\,k_0.$$
+
+That identity is the whole trick: left-multiplying an already-rotated cached key by $R(\Delta)$ moves it from position $p$ to $p+\Delta$ **without re-running the model**. Concretely, using the model's own rotary frequencies $f$ and the shift angle $\theta = \Delta f$, the re-indexed key is
+
+$$k' = k \odot \cos\theta \; + \; \mathrm{rotate\_half}(k) \odot \sin\theta.$$
+
+Each worker $w$ is shifted by $\Delta_w$ = the combined length of all workers placed before it, which drops every block at its true offset in the stitched sequence. Values carry no positional phase, so they are left untouched. (`--no_reindex` turns the shift off, to measure that it matters.)
 
 ## Running it
 
