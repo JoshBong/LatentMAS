@@ -6,6 +6,12 @@ A fork of [LatentMAS](https://github.com/Gen-Verse/LatentMAS) that adds **routed
   <img alt="Routed Latent Collaboration architecture" src="assets/routed-latentmas.png" width="900">
 </p>
 
+## Why skip the write-up
+
+When a team of agents solves a problem the usual way, each one researches its piece, writes an English summary, and hands that summary to the next. It works, but the write-up is the bottleneck. Most of what a model holds right after reading — the connections it just made, the half-formed hunches, the context around them — never survives being compressed into a few sentences. Every handoff flattens a rich internal state into prose and forces the next agent to rebuild its understanding from the condensed version. Thought becomes English becomes thought, and information leaks at each conversion.
+
+Routed LatentMAS removes that step. Each worker builds its internal working memory as it reads its slice, and the judge inherits that memory directly instead of a written report. The judge never reads a summary of the research; it picks up where each worker's mind left off, all at once. The effect is close to a hive mind: every worker reads its own segment deeply and in parallel, and one mind ends up holding all of it as if it had done the whole research itself — full context kept, nothing flattened into prose along the way.
+
 ## How agents communicate through the KV cache
 
 When a transformer reads text, it builds a **key/value (KV) cache**: the stored attention state for every token it has processed. This is the model's working memory of the context. LatentMAS's core idea is that agents can hand this cache to each other directly instead of writing and re-reading text — agent B is given agent A's KV cache and attends to it as if it had read A's context itself. No serialization to text, no re-reading; the reasoning stays in latent space.
