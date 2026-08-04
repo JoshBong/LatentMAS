@@ -118,6 +118,91 @@ def token_f1(pred: str, gold: str) -> float:
     return 2 * prec * rec / (prec + rec)
 
 
+# ---------------------------------------------------------------- unified scoring
+# ONE scorer, used by every method (baseline / text_mas / latent_mas / routed_mas).
+#
+# Why this exists: the three comparison arms each rolled their own scoring, and
+# they were not comparable.
+#   * baseline.py and text_mas.py had NO free-form branch at all, so on hotpotqa
+#     they fell through to extract_gsm8k_answer() -- "grab the last number in the
+#     string" -- and scored ~0 for purely mechanical reasons. `single` is the
+#     self-declared "arm to beat" in experiments/run_suite.py; it was losing to a
+#     regex, not to a method.
+#   * latent_mas.py used answer_hit(final_text, gold): whole-word recall over the
+#     ENTIRE raw response. A rambling judge that merely names the gold entity
+#     among six others got credit. Inflated, and incomparable to published
+#     HotpotQA numbers.
+#   * routed_mas.py used strict SQuAD-normalised EM on the EXTRACTED answer.
+#     That one was right; it is now the shared implementation.
+#
+# Any cross-arm accuracy comparison made before this landed is uninterpretable.
+
+NUMERIC_TASKS = frozenset({"gsm8k", "aime2024", "aime2025"})
+CODE_TASKS = frozenset({"mbppplus", "humanevalplus"})
+
+
+def _as_number(s) -> Optional[float]:
+    """Parse a numeric answer to float, tolerating commas / $ / % / trailing .0."""
+    if s is None:
+        return None
+    t = str(s).strip().replace(",", "").replace("$", "").rstrip("%").strip()
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", t)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+def numeric_eq(pred, gold) -> bool:
+    """Numeric equality with a normalised-string fallback. Strictly more forgiving
+    than the old `normalize_answer(pred) == gold` (which failed 18.0 vs 18) while
+    never accepting anything that comparison would have rejected."""
+    p, g = _as_number(pred), _as_number(gold)
+    if p is not None and g is not None:
+        return abs(p - g) < 1e-6
+    gs = squad_norm(gold)
+    return bool(gs) and squad_norm(pred) == gs
+
+
+def extract_prediction(text: str, task: str) -> str:
+    """Pull the short answer out of a response, by task family.
+
+    Numeric tasks: \\boxed{} value, else the last number (extract_gsm8k_answer).
+    Everything else (hotpotqa and friends): strip the <think> block, then
+    \\boxed{} / an explicit 'answer is|:' span / the first sentence.
+    """
+    text = text or ""
+    if task in NUMERIC_TASKS:
+        m = _BOXED_RE.search(text)
+        if m:
+            inner = m.group(1).strip()
+            n = re.search(r"[-+]?\d+(?:\.\d+)?", inner)
+            return n.group(0) if n else inner
+        return extract_gsm8k_answer(text) or ""
+    return extract_answer(text)
+
+
+def score_prediction(text: str, gold, task: str):
+    """(pred, correct, f1) for any non-code task. Code tasks execute; see CODE_TASKS.
+
+    Scores the EXTRACTED answer, never a substring match against the raw
+    response. token_f1 is the softer secondary metric, on the same extracted
+    pred, so `mean_f1` in run.py is now populated for every arm rather than only
+    for routed_mas.
+    """
+    pred = extract_prediction(text, task)
+    gold_s = "" if gold is None else str(gold).strip()
+    if not gold_s:
+        return pred, False, 0.0
+    if task in NUMERIC_TASKS:
+        ok = numeric_eq(pred, gold_s)
+    else:
+        ok = bool(squad_norm(pred)) and squad_norm(pred) == squad_norm(gold_s)
+    return pred, bool(ok), token_f1(pred, gold_s)
+
+
 def extract_markdown_python_block(text: str) -> Optional[str]:
     pattern = r"```python(.*?)```"
     matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)

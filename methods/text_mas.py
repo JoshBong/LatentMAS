@@ -4,7 +4,12 @@ from . import default_agents
 from models import ModelWrapper
 # from prompts import build_agent_messages, build_agent_messages_v6, build_agent_messages_v6_text_mas
 from prompts import build_agent_messages_hierarchical_text_mas, build_agent_messages_sequential_text_mas
-from utils import extract_gsm8k_answer, normalize_answer, extract_markdown_python_block, run_with_timeout
+from utils import (
+    CODE_TASKS,
+    extract_markdown_python_block,
+    run_with_timeout,
+    score_prediction,
+)
 import argparse
 import pdb
 
@@ -133,7 +138,8 @@ class TextMASMethod:
         for idx, item in enumerate(items):
             final_text = final_texts[idx]
             
-            if self.task in ['mbppplus', 'humanevalplus']:
+            f1 = None
+            if self.task in CODE_TASKS:
                 pred = extract_markdown_python_block(final_text)
                 gold = item.get("gold", "")
 
@@ -143,27 +149,15 @@ class TextMASMethod:
                 else:
                     python_code_to_exe = pred + "\n" + gold
                     ok, error_msg = run_with_timeout(python_code_to_exe, timeout=10)
-    
+
                 print(f'=========================================')
                 print(f'Question {idx}')
                 print(f'error_msg: {error_msg}')
 
-            elif self.task in ["aime2024", "aime2025"]:
-                pred = normalize_answer(extract_gsm8k_answer(final_text))
-                gold = str(item.get("gold", "")).strip()
-                try:
-                    pred_int = int(pred)
-                    gold_int = int(gold)
-                    ok = (pred_int == gold_int)
-                    error_msg = None
-                except ValueError:
-                    ok = False
-                    error_msg = f'Value error in parsing answer. Pred: {pred}, Gold: {gold}'
-
             else:
-                pred = normalize_answer(extract_gsm8k_answer(final_text))
+                # Shared scorer -- see utils.score_prediction.
                 gold = item.get("gold", "")
-                ok = (pred == gold) if (pred and gold) else False
+                pred, ok, f1 = score_prediction(final_text, gold, self.task)
                 error_msg = None
 
             results.append(
@@ -176,6 +170,7 @@ class TextMASMethod:
                     "raw_prediction": final_text,
                     "agents": agent_traces[idx],
                     "correct": ok,
+                    "f1": f1,
                 }
             )
         return results

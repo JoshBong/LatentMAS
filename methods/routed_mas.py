@@ -30,7 +30,7 @@ import torch
 
 from . import Agent
 from models import ModelWrapper
-from utils import extract_answer, extract_gsm8k_answer, squad_norm, token_f1
+from utils import extract_prediction, score_prediction, squad_norm, token_f1
 from prompts_routed import (
     build_orchestrator_prompt,
     build_routed_judger,
@@ -109,34 +109,17 @@ class RoutedMASMethod:
         self.n_workers = len(self.workers)
 
     # ------------------------------------------------------------------ scoring
+    # Thin wrappers over the shared implementation in utils. This scorer used to
+    # live here and was the only correct one in the repo; it now lives in
+    # utils.score_prediction so baseline / text_mas / latent_mas use the identical
+    # code path and the arms are actually comparable. Behaviour here is unchanged
+    # except that numeric tasks now compare numerically (18.0 == 18).
     def _extract(self, text: str) -> str:
-        # math: pull the boxed value / final number
-        if self.task in ("gsm8k", "aime2024", "aime2025"):
-            m = re.search(r"\\boxed\{(.+?)\}", text, flags=re.DOTALL)
-            if m:
-                return m.group(1).strip()
-            got = extract_gsm8k_answer(text)
-            if got:
-                return got
-        # free-form (hotpotqa): strip <think>, take boxed / 'answer is' / first sentence
-        return extract_answer(text)
+        return extract_prediction(text, self.task)
 
     def _score(self, pred_text: str, gold: str) -> tuple:
-        """Strict, extraction-based EM on BOTH paths.
-
-        Score the EXTRACTED answer, never substring-match the raw response: a
-        rambling judge that merely names the gold entity among six others must not
-        get credit (the old free-form path did `answer_hit(pred_text, gold)`, whole-
-        word recall over the whole response -- inflated, and incomparable to
-        published HotpotQA). This is SQuAD-normalized EM, matching probe.py::em, so
-        the two harnesses finally agree. token_f1 stays as the softer secondary
-        metric (computed in _run_item, on the same extracted pred).
-        """
-        pred = self._extract(pred_text)
-        if not gold:
-            return pred, False
-        ok = squad_norm(pred) == squad_norm(gold)
-        return pred, bool(ok)
+        pred, ok, _f1 = score_prediction(pred_text, gold, self.task)
+        return pred, ok
 
     def _ntok(self, text: str) -> int:
         """Token count of a decoded string, for the accounting summary. Uses the

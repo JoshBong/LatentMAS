@@ -3,7 +3,12 @@ from typing import Dict, List, Optional, Tuple
 from . import default_agents
 from models import ModelWrapper, _past_length
 from prompts import build_agent_message_sequential_latent_mas, build_agent_message_hierarchical_latent_mas
-from utils import extract_gsm8k_answer, normalize_answer, extract_markdown_python_block, run_with_timeout
+from utils import (
+    CODE_TASKS,
+    extract_markdown_python_block,
+    run_with_timeout,
+    score_prediction,
+)
 import torch
 import argparse
 
@@ -267,7 +272,8 @@ class LatentMASMethod:
         results: List[Dict] = []
         for idx, item in enumerate(items):
             final_text = final_texts[idx]
-            if self.task in ['mbppplus', 'humanevalplus']:
+            f1 = None
+            if self.task in CODE_TASKS:
                 pred = extract_markdown_python_block(final_text)
                 gold = item.get("gold", "")
 
@@ -277,35 +283,20 @@ class LatentMASMethod:
                 else:
                     python_code_to_exe = pred + "\n" + gold
                     ok, error_msg = run_with_timeout(python_code_to_exe, timeout=10)
-                
+
                 print(f'=========================================')
                 print(f'Question {idx}')
                 print(f'error_msg: {error_msg}')
                 # print(f'=========================================')
 
-            elif self.task in ["aime2024", "aime2025"]:
-                pred = normalize_answer(extract_gsm8k_answer(final_text))
-                gold = str(item.get("gold", "")).strip()
-                try:
-                    pred_int = int(pred)
-                    gold_int = int(gold)
-                    ok = (pred_int == gold_int)
-                    error_msg = None
-                except ValueError:
-                    ok = False
-                    error_msg = f'Value error in parsing answer. Pred: {pred}, Gold: {gold}'
-
-            elif self.task == "hotpotqa":
-                # free-form: judge writes prose; extract + recall-match (same as routed)
-                from utils import answer_hit, extract_answer
-                gold = item.get("gold", "")
-                pred = extract_answer(final_text)
-                ok = answer_hit(final_text, gold) if gold else False
-                error_msg = None
             else:
-                pred = normalize_answer(extract_gsm8k_answer(final_text))
+                # Shared scorer -- see utils.score_prediction. This replaces the
+                # old hotpotqa branch, which used answer_hit() over the WHOLE raw
+                # response (whole-word recall). That gave credit to a rambling
+                # judge that merely named the gold entity among several, inflating
+                # this arm relative to routed_mas's extraction-based EM.
                 gold = item.get("gold", "")
-                ok = (pred == gold) if (pred and gold) else False
+                pred, ok, f1 = score_prediction(final_text, gold, self.task)
                 error_msg = None
 
             results.append(
@@ -317,6 +308,7 @@ class LatentMASMethod:
                     "raw_prediction": final_text,
                     "agents": agent_traces[idx],
                     "correct": ok,
+                    "f1": f1,
                 }
             )
         return results
@@ -498,9 +490,9 @@ class LatentMASMethod:
         results: List[Dict] = []
         for idx, item in enumerate(items):
             final_text = final_texts[idx]
-            pred = normalize_answer(extract_gsm8k_answer(final_text))
             gold = item["gold"]
-            ok = (pred == gold) if (pred and gold) else False
+            # Shared scorer -- the vLLM path had no free-form branch either.
+            pred, ok, f1 = score_prediction(final_text, gold, self.task)
             results.append(
                 {
                     "question": item["question"],
@@ -510,6 +502,7 @@ class LatentMASMethod:
                     "raw_prediction": final_text,
                     "agents": agent_traces[idx],
                     "correct": ok,
+                    "f1": f1,
                 }
             )
         return results
