@@ -2,7 +2,12 @@ from typing import Dict, List
 
 from models import ModelWrapper
 from prompts import build_agent_messages_single_agent
-from utils import extract_gsm8k_answer, normalize_answer, extract_markdown_python_block, run_with_timeout
+from utils import (
+    CODE_TASKS,
+    extract_markdown_python_block,
+    run_with_timeout,
+    score_prediction,
+)
 
 
 class BaselineMethod:
@@ -59,7 +64,8 @@ class BaselineMethod:
         for idx, item in enumerate(items):
             generated_text = generated_batch[idx]
             
-            if self.task in ['mbppplus', 'humanevalplus']:
+            f1 = None
+            if self.task in CODE_TASKS:
                 pred = extract_markdown_python_block(generated_text)
                 gold = item.get("gold", "")
 
@@ -69,30 +75,21 @@ class BaselineMethod:
                 else:
                     python_code_to_exe = pred + "\n" + gold
                     ok, error_msg = run_with_timeout(python_code_to_exe, timeout=10)
-                
+
                 print(f'=========================================')
                 print(f'Question {idx}')
                 print(f'error_msg: {error_msg}')
                 # print(f'=========================================')
 
-            elif self.task in ["aime2024", "aime2025"]:
-                pred = normalize_answer(extract_gsm8k_answer(generated_text))
-                gold = str(item.get("gold", "")).strip()
-                try:
-                    pred_int = int(pred)
-                    gold_int = int(gold)
-                    ok = (pred_int == gold_int)
-                    error_msg = None
-                except ValueError:
-                    ok = False
-                    error_msg = f'Value error in parsing answer. Pred: {pred}, Gold: {gold}'
-
             else:
-                pred = normalize_answer(extract_gsm8k_answer(generated_text))
+                # Shared scorer (utils.score_prediction) -- identical to the one
+                # latent_mas / text_mas / routed_mas use, so the arms are finally
+                # comparable. Previously this fell through to "grab the last
+                # number", which scored ~0 on hotpotqa regardless of the answer.
                 gold = item.get("gold", "")
-                ok = (pred == gold) if (pred and gold) else False
+                pred, ok, f1 = score_prediction(generated_text, gold, self.task)
                 error_msg = None
-            
+
             mask = attention_mask[idx].bool()
             trimmed_ids = input_ids[idx][mask].to("cpu").tolist()
             agent_trace = {
@@ -112,6 +109,7 @@ class BaselineMethod:
                     "raw_prediction": generated_text,
                     "agents": [agent_trace],
                     "correct": ok,
+                    "f1": f1,
                 }
             )
         return results
