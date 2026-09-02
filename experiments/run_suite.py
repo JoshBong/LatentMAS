@@ -43,6 +43,13 @@ ARM_FLAGS = {
     "judge_blind":      ["--method", "routed_mas", "--routing", "orchestrated", "--arm", "judge_blind"],
     "empty_cache":      ["--method", "routed_mas", "--routing", "orchestrated", "--arm", "empty_cache"],
     "noise_blocks":     ["--method", "routed_mas", "--routing", "orchestrated", "--arm", "noise_blocks"],
+    # routed_nl: decomposition + latent broadcast down + NL synthesis up.
+    # The three channels are the controlled A/B/kill: same topology, only the
+    # doc-delivery mechanism differs. If nl_kv ~= nl_nodocs, the broadcast
+    # carries nothing -- stop before believing any nl_kv number.
+    "nl_kv":            ["--method", "routed_nl", "--channel", "kv"],
+    "nl_text":          ["--method", "routed_nl", "--channel", "text"],
+    "nl_nodocs":        ["--method", "routed_nl", "--channel", "nodocs"],
 }
 
 
@@ -87,8 +94,9 @@ def main():
 
     for i, (arm, task, seed) in enumerate(runs, 1):
         # worker count in the id so `--num_workers 2` vs `3` don't collide (every
-        # routed_mas arm uses workers, incl. the kill-switch ablations)
-        nw = f"__nw{args.num_workers}" if "routed_mas" in ARM_FLAGS[arm] else ""
+        # routed_mas/routed_nl arm uses workers, incl. the kill-switch ablations)
+        uses_workers = any(m in ARM_FLAGS[arm] for m in ("routed_mas", "routed_nl"))
+        nw = f"__nw{args.num_workers}" if uses_workers else ""
         rid = f"{arm}{nw}__{task}__seed{seed}"
         rdir = out / rid
         rdir.mkdir(exist_ok=True)

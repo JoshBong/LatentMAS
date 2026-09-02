@@ -184,6 +184,101 @@ combine everyone's findings."""
     return _msgs(system, user)
 
 
+# --------------------------------------------------------------------- routed_nl
+# Prompts for the NL-synthesis fork (methods/routed_nl.py): shared context is
+# prefilled ONCE into a KV prefix, workers continue from it in one batch and
+# answer in text, the judge reads their text. The three builders below are
+# designed as ONE coherent chat conversation:
+#
+#     nl_lead   system + user(context docs + question)      -> S0 (no gen prompt)
+#     nl_worker a lone user turn with the worker's subtask  -> continues S0
+#     nl_judger standalone prompt over the workers' text findings
+#
+# The worker turn deliberately contains NO system message and NO documents: the
+# rendered sequence [lead || worker turn] is a well-formed single conversation,
+# so the prefix broadcast needs no cache stitching, no RoPE re-indexing, and
+# introduces no duplicate chat-template headers.
+
+
+def build_nl_lead(question: str, context_docs: Optional[List[str]] = None) -> List[dict]:
+    """The shared prefix: ALL evidence + the question, encoded exactly once."""
+    docs = context_docs or []
+    doc_block = ""
+    if docs:
+        doc_block = "Context documents:\n\n" + "\n\n".join(
+            f"[Document {i + 1}]\n{d}" for i, d in enumerate(docs)) + "\n\n"
+    system = ("You are part of a team answering a question. Each worker will be "
+              "assigned one subtask; read the material carefully first.")
+    user = f"""{doc_block}Question: {question}
+
+Each worker will now receive their assigned subtask."""
+    return _msgs(system, user)
+
+
+def build_nl_worker_turn(brief: Optional[str], w_idx: int, n_workers: int) -> List[dict]:
+    """The worker's OWN turn only -- rendered on top of the lead prefix."""
+    task = brief or f"Cover worker {w_idx + 1}'s share of the question."
+    user = (f"You are Worker {w_idx + 1} of {n_workers}.\n"
+            f"Your assigned subtask: {task}\n\n"
+            f"Using ONLY the context documents above, report the facts relevant to "
+            f"your subtask in 2-4 sentences. Note what the documents do and do not "
+            f"establish. Do not answer the overall question.")
+    return [{"role": "user", "content": user}]
+
+
+def build_nl_worker_standalone(
+    question: str,
+    brief: Optional[str],
+    w_idx: int,
+    n_workers: int,
+    context_docs: Optional[List[str]] = None,
+) -> List[dict]:
+    """The text-channel control: SAME subtask, SAME information, but the documents
+    arrive as text in this worker's own prompt (re-encoded per worker) instead of
+    through the shared KV prefix. The A/B against build_nl_worker_turn isolates
+    the delivery channel, holding topology and content fixed."""
+    docs = context_docs or []
+    task = brief or f"Cover worker {w_idx + 1}'s share of the question."
+    doc_block = ""
+    if docs:
+        doc_block = "Context documents:\n\n" + "\n\n".join(
+            f"[Document {i + 1}]\n{d}" for i, d in enumerate(docs)) + "\n\n"
+    system = (f"You are Worker {w_idx + 1} of {n_workers} on a team answering a "
+              f"question. Focus ONLY on your assigned subtask.")
+    user = (f"{doc_block}Question: {question}\n\n"
+            f"Your assigned subtask: {task}\n\n"
+            f"Using ONLY the context documents{' above' if docs else ' you were given'}, "
+            f"report the facts relevant to your subtask in 2-4 sentences. Note what "
+            f"the documents do and do not establish. Do not answer the overall question.")
+    return _msgs(system, user)
+
+
+def build_nl_judger(question: str, findings: List[str], args=None) -> List[dict]:
+    """Synthesis in plain language: the judge reads the workers' TEXT findings.
+    No cache surgery, no latent channel -- the judge context is the question plus
+    a few sentences per worker, instead of every document."""
+    system = ("You are the judge. Combine the workers' findings into a final "
+              "answer. Findings may be partial or contain irrelevant content -- "
+              "use what helps and ignore the rest.")
+    task = getattr(args, "task", None)
+    if task in ("gsm8k", "aime2024", "aime2025"):
+        fmt = "Reason step by step and output the final answer inside \\boxed{YOUR_FINAL_ANSWER}."
+    elif task in ("arc_easy", "arc_challenge", "gpqa", "medqa"):
+        fmt = "Select from A,B,C,D and output it inside \\boxed{}, e.g. \\boxed{A}."
+    else:  # hotpotqa and free-form
+        fmt = ("Give the shortest exact answer (a name, entity, number, or yes/no) "
+               "inside \\boxed{YOUR_FINAL_ANSWER}.")
+    blocks = "\n\n".join(
+        f"[Worker {i + 1} findings]\n{t if t.strip() else '(no findings)'}"
+        for i, t in enumerate(findings))
+    user = f"""Target Question: {question}
+
+{blocks}
+
+{fmt}"""
+    return _msgs(system, user)
+
+
 def build_routed_judger(question: str, args=None, blind: bool = False) -> List[dict]:
     """Judge prompt. `blind` (the judge_blind kill-switch) withholds the question
     text so the judge must recover the task from the latent findings alone -- if it

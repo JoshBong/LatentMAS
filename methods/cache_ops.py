@@ -72,6 +72,26 @@ def clone_cache(cache):
     return _from_legacy(cloned, cache)
 
 
+def expand_cache(cache, n: int):
+    """View a batch-1 cache as batch-n WITHOUT copying the K/V storage.
+
+    Used at the routed_nl fan-out: every worker continues from the same shared
+    prefix S0, so the base K/V can be a broadcast view (`Tensor.expand`) rather
+    than n deep copies -- peak memory for the shared prefix is |S0|, not n*|S0|.
+    Safe because the prefix is only ever READ during the workers' forwards; the
+    workers' own new K/V are appended by `torch.cat` inside the model's cache
+    update, which allocates fresh tensors and never mutates the shared base.
+    """
+    legacy = _to_legacy(cache)
+    if legacy and legacy[0] is not None and legacy[0][0].shape[0] != 1:
+        raise ValueError(f"expand_cache expects batch 1, got {legacy[0][0].shape[0]}")
+    expanded = tuple(
+        tuple(t.expand(n, *t.shape[1:]) for t in layer)
+        for layer in legacy
+    )
+    return _from_legacy(expanded, cache)
+
+
 def cache_suffix(cache, start: int):
     """Keep only sequence positions [start:] -- i.e. a worker's own tokens after
     the shared prefix. `start` is typically the base-cache length."""

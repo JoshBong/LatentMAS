@@ -44,6 +44,38 @@ $$k' = k \odot \cos\theta \; + \; \mathrm{rotate\_half}(k) \odot \sin\theta.$$
 
 Each worker $w$ is shifted by $\Delta_w$ = the combined length of all workers placed before it, which drops every block at its true offset in the stitched sequence. Values carry no positional phase, so they are left untouched. (`--no_reindex` turns the shift off, to measure that it matters.)
 
+## routed_nl: decomposition down the latent channel, synthesis in language
+
+`--method routed_nl` is the second fork method: a true division-of-labor MAS.
+An orchestrator decodes one subtask per worker; the shared context (all
+documents + question) is prefilled **once** into a KV prefix and broadcast to
+every worker as a batch-expanded *view* (no copies); the workers decode their
+findings **in one batched forward** (genuine parallelism, not a worker loop);
+the judge reads their few-sentence text findings and answers.
+
+Because every forward is a positionally honest continuation of a real prefix,
+this method needs **none** of the cache surgery above — no suffix slicing, no
+RoPE re-indexing, no stitched-cache decode. The mechanism under test is the
+prefix broadcast itself, and `--channel` isolates it with the topology held
+fixed:
+
+| channel  | how the documents reach the workers                     |
+|----------|---------------------------------------------------------|
+| `kv`     | encoded once into the shared KV prefix (the mechanism)  |
+| `text`   | repeated as text in every worker's own prompt (the cost control) |
+| `nodocs` | withheld everywhere (kill-switch: if `kv` ≈ `nodocs`, the broadcast carries nothing) |
+
+The honest pitch is small and checkable from the per-item accounting
+(`s0_prompt_tokens`, `prompt_tokens`, `judge_ctx_tokens` in trials.jsonl):
+same decomposition accuracy as text delivery, documents paid once instead of
+once per worker, and a judge that reads a page of findings instead of every
+document.
+
+Related work to cite against, not claim over: LatentMAS's own hierarchical mode
+(latent within agents, text aggregation), latent-synthesis judges over parallel
+branches (arXiv 2606.14672 — a *learned* latent up-leg that beats text), and
+shared-prefix caching (Prompt Cache / KVLink lineage) for the down-leg.
+
 ## Running it
 
 ```bash
@@ -52,6 +84,15 @@ pip install -r requirements.txt
 
 # routed fan-out on comparison questions (2 disjoint entities -> 2 workers)
 python run.py --method routed_mas --model_name Qwen/Qwen3-4B --task hotpotqa --num_workers 2
+
+# decomposition + KV broadcast + NL synthesis, and its two controls
+python run.py --method routed_nl --channel kv     --model_name Qwen/Qwen3-4B --task hotpotqa
+python run.py --method routed_nl --channel text   --model_name Qwen/Qwen3-4B --task hotpotqa
+python run.py --method routed_nl --channel nodocs --model_name Qwen/Qwen3-4B --task hotpotqa
+
+# or the whole matrix via the suite runner
+python experiments/run_suite.py --model Qwen/Qwen3-4B --tasks hotpotqa \
+    --arms single nl_kv nl_text nl_nodocs --seeds 42 43 44 --max_samples 100 --out results/nl
 ```
 
 For comparison: `--method baseline` (one agent, full context) and `--method latent_mas` (the base chain).
