@@ -820,13 +820,16 @@ Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_
 """
 
     else:
+        # Free-form tasks (hotpotqa and friends): demand \boxed{} exactly like the
+        # routed/nl judgers do, so the shared scorer sees the same answer format
+        # in every arm (handoff §3 — arm-comparability fix).
         user_content = f"""
 Question: {question}
 
 You are a helpful assistant.
 
 You must reason step-by-step to solve the question without outputting other irrelevant information.
-Present your reasoning, and then clearly state your final answer at the end.
+Give the shortest exact answer (a name, entity, number, or yes/no) inside \\boxed{{YOUR_FINAL_ANSWER}}.
 """
 
     return [
