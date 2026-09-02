@@ -19,6 +19,7 @@ from data import (
 from methods.baseline import BaselineMethod
 from methods.latent_mas import LatentMASMethod
 from methods.routed_mas import RoutedMASMethod
+from methods.routed_nl import RoutedNLMethod
 from methods.text_mas import TextMASMethod
 from models import ModelWrapper
 from utils import auto_device, set_seed
@@ -56,9 +57,10 @@ def process_batch(
         preds.append(res)
         if args.log_file:
             keep = ("question", "gold", "prediction", "raw_prediction", "correct", "f1",
-                    "routing", "arm", "worker_divergence", "n_workers", "n_briefs_parsed",
-                    "briefs", "doc_assign", "latent_steps", "prompt_tokens", "gen_tokens",
-                    "latent_tokens")
+                    "routing", "arm", "channel", "worker_divergence", "n_workers",
+                    "n_briefs_parsed", "briefs", "doc_assign", "latent_steps",
+                    "prompt_tokens", "gen_tokens", "latent_tokens", "worker_texts",
+                    "s0_prompt_tokens", "s0_cache_len", "judge_ctx_tokens")
             with open(args.log_file, "a", encoding="utf-8") as lf:
                 lf.write(json.dumps({k: res.get(k) for k in keep}, ensure_ascii=False) + "\n")
         problem_idx = batch_start + offset + 1
@@ -98,7 +100,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     # core args for experiments
-    parser.add_argument("--method", choices=["baseline", "text_mas", "latent_mas", "routed_mas"], required=True)
+    parser.add_argument("--method", choices=["baseline", "text_mas", "latent_mas", "routed_mas", "routed_nl"], required=True)
     parser.add_argument("--model_name", type=str, required=True, #choices=["Qwen/Qwen3-4B", "Qwen/Qwen3-4B", "Qwen/Qwen3-14B"]
     )
     parser.add_argument("--max_samples", type=int, default=100)
@@ -113,6 +115,10 @@ def main():
                         help="routed_mas kill-switch ablation: normal | judge_blind (question not "
                              "restated) | empty_cache (workers dropped, S0 only) | noise_blocks "
                              "(worker suffixes replaced by shape/norm-matched noise)")
+    parser.add_argument("--channel", choices=["kv", "text", "nodocs"], default="kv",
+                        help="routed_nl doc-delivery channel: kv (docs prefilled once into a shared "
+                             "KV prefix, broadcast to all workers) | text (docs repeated as text in "
+                             "every worker prompt) | nodocs (kill-switch: docs reach nobody)")
     parser.add_argument("--log_file", type=str, default=None,
                         help="Append per-item results as JSONL (prediction/correct/f1/worker_divergence/briefs)")
     parser.add_argument("--prompt", type=str, choices=["sequential", "hierarchical"], default="sequential")
@@ -222,6 +228,14 @@ def main():
             generate_bs=args.generate_bs,
             args=args,
         )
+    elif args.method == 'routed_nl':
+        method = RoutedNLMethod(
+            model,
+            judger_max_new_tokens=args.max_new_tokens,
+            **common_kwargs,
+            num_workers=args.num_workers,
+            args=args,
+        )
 
     preds: List[Dict] = []
     processed = 0
@@ -278,8 +292,9 @@ def main():
         if processed >= args.max_samples:
             break
         # Non-routed arms must see the same evidence: fold all HotpotQA docs into
-        # the question. routed_mas instead splits `context_docs` across workers.
-        if args.task == "hotpotqa" and args.method != "routed_mas" and "question_full" in item:
+        # the question. routed_mas splits `context_docs` across workers; routed_nl
+        # delivers them via its --channel (KV prefix / per-worker text / withheld).
+        if args.task == "hotpotqa" and args.method not in ("routed_mas", "routed_nl") and "question_full" in item:
             item = {**item, "question": item["question_full"]}
         batch.append(item)
         if len(batch) == args.generate_bs or processed + len(batch) == args.max_samples:
@@ -342,6 +357,18 @@ def main():
             summary["n_briefs_parsed_mean"] = round(sum(nb) / len(nb), 2)
         # Token accounting -> can finally speak to the parent's 50-80% reduction claim.
         for key in ("prompt_tokens", "gen_tokens", "latent_tokens"):
+            vals = [p.get(key) for p in preds if p.get(key) is not None]
+            if vals:
+                summary[f"total_{key}"] = sum(vals)
+                summary[f"mean_{key}"] = round(sum(vals) / len(vals), 2)
+    if args.method == "routed_nl":
+        summary["channel"] = args.channel
+        nb = [p.get("n_briefs_parsed") for p in preds if p.get("n_briefs_parsed") is not None]
+        if nb:
+            summary["n_briefs_parsed_min"] = min(nb)
+        # The cost claim: docs paid once (kv) vs once-per-worker (text). The
+        # per-item fields make the totals auditable from trials.jsonl.
+        for key in ("prompt_tokens", "gen_tokens", "s0_prompt_tokens", "judge_ctx_tokens"):
             vals = [p.get(key) for p in preds if p.get(key) is not None]
             if vals:
                 summary[f"total_{key}"] = sum(vals)

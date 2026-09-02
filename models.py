@@ -145,18 +145,25 @@ class ModelWrapper:
         batch_messages: List[List[Dict]],
         add_generation_prompt: bool = True,
         enable_thinking: bool = False,   # default OFF — see render_chat
+        padding_side: Optional[str] = None,  # "left" for batched decode-from-prefix
     ) -> Tuple[List[str], torch.Tensor, torch.Tensor, List[List[str]]]:
         prompts: List[str] = []
         for messages in batch_messages:
             prompts.append(self.render_chat(
                 messages, add_generation_prompt=add_generation_prompt,
                 enable_thinking=enable_thinking))
-        encoded = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            add_special_tokens=False,
-        )
+        saved_side = self.tokenizer.padding_side
+        if padding_side is not None:
+            self.tokenizer.padding_side = padding_side
+        try:
+            encoded = self.tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                add_special_tokens=False,
+            )
+        finally:
+            self.tokenizer.padding_side = saved_side
         input_ids = encoded["input_ids"].to(self.device)
         attention_mask = encoded["attention_mask"].to(self.device)
         tokens_batch: List[List[str]] = []
@@ -339,6 +346,106 @@ class ModelWrapper:
         if not gen:
             return ""
         return self.tokenizer.decode(torch.cat(gen, dim=1)[0], skip_special_tokens=True)
+
+    @torch.no_grad()
+    def decode_text_batch_from_prefix(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        past_key_values=None,
+        *,
+        max_new_tokens: int = 256,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+    ) -> List[str]:
+        """Decode N sequences IN ONE BATCH, each continuing from the same shared
+        prefix cache (or from nothing when past_key_values is None).
+
+        This is the routed_nl fan-out: the workers are a genuine batched forward
+        pass -- one GPU call per decode step for all workers -- not a Python loop
+        over workers. `input_ids`/`attention_mask` must be LEFT-padded
+        (prepare_chat_batch(..., padding_side="left")); the shared prefix must be
+        batch-N already (cache_ops.expand_cache).
+
+        Positions are computed PER ROW from the attention mask, so each row's
+        real tokens sit at prefix_len, prefix_len+1, ... regardless of how much
+        padding sits to its left -- we do not trust generate()'s uniform
+        cache_position bookkeeping with a non-uniform batch. Pad slots stay
+        masked for the whole decode, so their K/V are never attended to.
+
+        temperature <= 0 means greedy; otherwise temperature/top_p sampling
+        (matches the repo's sampled-judge convention).
+        """
+        hf = getattr(self, "HF_model", None) or self.model
+        dev = self.device
+        ids = input_ids.to(dev)
+        mask = attention_mask.to(dev)
+        n, seq_len = ids.shape
+        plen = _past_length(past_key_values)
+
+        # Row-wise positions: pads before a row's first real token are masked out;
+        # real token j of a row sits at plen + j.
+        pos = mask.long().cumsum(-1) - 1 + plen
+        pos = pos.clamp_min(0)
+        full_mask = mask
+        if plen > 0:
+            past_mask = torch.ones((n, plen), dtype=mask.dtype, device=dev)
+            full_mask = torch.cat([past_mask, mask], dim=-1)
+
+        out = hf(input_ids=ids, attention_mask=full_mask, position_ids=pos,
+                 past_key_values=past_key_values, use_cache=True)
+        past = out.past_key_values
+        logits = out.logits[:, -1]
+
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        next_pos = (pos.max(dim=-1).values + 1)                # [n] per-row next position
+        finished = torch.zeros(n, dtype=torch.bool, device=dev)
+        gen_cols: List[torch.Tensor] = []
+
+        def _pick(lg: torch.Tensor) -> torch.Tensor:
+            if temperature is None or temperature <= 0:
+                return lg.argmax(-1, keepdim=True)
+            probs = torch.softmax(lg / temperature, dim=-1)
+            if top_p is not None and top_p < 1.0:
+                sp, si = torch.sort(probs, descending=True, dim=-1)
+                cum = sp.cumsum(-1)
+                cut = cum - sp >= top_p                        # tokens beyond the nucleus
+                sp = sp.masked_fill(cut, 0.0)
+                sp = sp / sp.sum(-1, keepdim=True)
+                choice = torch.multinomial(sp, 1)
+                return si.gather(-1, choice)
+            return torch.multinomial(probs, 1)
+
+        for _ in range(max_new_tokens):
+            nxt = _pick(logits)                                # [n, 1]
+            if eos_id is not None:
+                finished = finished | (nxt.squeeze(-1) == eos_id)
+                nxt = torch.where(finished.unsqueeze(-1),
+                                  torch.full_like(nxt, pad_id), nxt)
+            gen_cols.append(nxt)
+            if bool(finished.all()):
+                break
+            step_pos = next_pos.unsqueeze(-1)                  # [n, 1]
+            next_pos = next_pos + 1
+            full_mask = torch.cat(
+                [full_mask, (~finished).long().unsqueeze(-1).to(full_mask.dtype)], dim=-1)
+            out = hf(input_ids=nxt, attention_mask=full_mask, position_ids=step_pos,
+                     past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            logits = out.logits[:, -1]
+
+        if not gen_cols:
+            return ["" for _ in range(n)]
+        gen = torch.cat(gen_cols, dim=1)                       # [n, T]
+        texts: List[str] = []
+        for row in gen:
+            toks = row.tolist()
+            if eos_id is not None and eos_id in toks:
+                toks = toks[:toks.index(eos_id)]
+            toks = [t for t in toks if t != pad_id]
+            texts.append(self.tokenizer.decode(toks, skip_special_tokens=True).strip())
+        return texts
 
     def tokenize_text(self, text: str) -> torch.Tensor:
         return self.tokenizer(
