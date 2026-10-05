@@ -140,7 +140,7 @@ The content loss is the real problem, and it can't be fixed after the fact: no t
 ## Running it
 
 ```bash
-git clone -b routed-mas https://github.com/JoshBong/LatentMAS.git && cd LatentMAS
+git clone https://github.com/JoshBong/LatentMAS.git && cd LatentMAS
 pip install -r requirements.txt "transformers>=5" matplotlib   # results in section 7 used transformers 5
 
 # routed fan-out (2 entities -> 2 workers)
