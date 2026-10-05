@@ -1,600 +1,170 @@
-<a name="readme-top"></a>
+# Routed LatentMAS
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo.png">
-    <img alt="ScienceLatentMAS" src="assets/logo.png" width=500>
-  </picture>
-</p>
+**A research log: can a truly parallel multi-agent system divide *information*, not just thinking?**
 
-<h3 align="center">
-Latent Collaboration in Multi-Agent Systems, based on the LatentMAS repository.
-</h3>
+I wanted to know whether LLM agents could split up a problem and hand their work to each other as **KV cache** instead of text. This is what I thought, what I built, what broke, and what I changed because of it, in the order it happened. Commit hashes link the code at each step.
 
+Fork of [LatentMAS](https://github.com/Gen-Verse/LatentMAS) (Zou et al., [arXiv:2511.20639](https://arxiv.org/abs/2511.20639)).
 
+LatentMAS chains agents through one shared cache. I tried to run the agents in parallel and merge their caches. The merged caches carry real information but lose to one model reading everything (50% vs. 64% exact match on HotpotQA), because parallel workers never see each other's work. Sharing the *input* cache and having workers report back in text keeps the accuracy (62%) at 40% fewer prompt tokens than handing every worker the documents.
 
-<p align="center">
-    <a href="https://arxiv.org/abs/2511.20639"><img src="https://img.shields.io/badge/arXiv-2511.20639-B31B1B.svg?logo=arxiv" alt="Arxiv"></a>
-    <a href="https://huggingface.co/papers/2511.20639"><img src="https://img.shields.io/badge/Huggingface-DailyPaper-FFD21E.svg?logo=huggingface" alt="Huggingface Paper"></a>
-    <a href="https://x.com/LingYang_PU/status/1993510834245714001"><img src="https://img.shields.io/badge/Coverage-LatentMAS-2176BC.svg?logo=x" alt="X"></a>
-  
-  </p>
+![Routed LatentMAS architecture](assets/routed-latentmas.png)
 
 ---
 
-<p align="center">
-  <img src="assets/main_res.png" width="1000">
-</p>
-
-## 💡 Introduction (Science-LatentMAS)
 
 
-**LatentMAS** is a flexible multi-agent reasoning framework that **moves agent collaboration from token space into the model’s latent space**.  This repo extends the original code to have more flexibility. 
+## Dividing the thinking vs. dividing the information
 
-Instead of producing long textual reasoning traces, agents communicate by **passing latent thoughts** through their own **working memory**. LatentMAS has the following key features:
-
-- **Efficient** multi-step reasoning with drastically fewer tokens  
-- **Training-free** latent-space alignment for stable generation  
-- **A general technique** compatible with **any HF model** and optionally **vLLM** backends.
-
-<p align="center">
-  <img src="assets/main.png" width="1000">
-</p>
-
-
-**The Science-LatentMAS branch** is an extended version of LatentMAS designed to better support scientific research and discovery workflows. It introduces customizable agent roles and prompts (e.g., Researcher, Analyst), enabling LatentMAS to imitate different scientific reasoning and discovery schemes. It also provides hybrid text–latent generation, flexible agent ordering, and customizable thinking tokens, which further facilitate collaboration across different scientific research agents. 
-
-Overall, Science-LatentMAS offers a lightweight and flexible framework for structured scientific reasoning and discovery while remaining fully compatible with the original LatentMAS design.
-
-## 📊 Experiments Overview
-
-
-### ⭐ Main Results  
-Three main tables from our paper spanning 9 tasks across math & science reasoning, commensonse reasoning, and code generation:
-
-- **Table 1 — LatentMAS under the Sequantial MAS setting**  
-  <p align="center"><img src="assets/main_table1.png" width="1000"></p>
-
-- **Table 2 — LatentMAS under the Hierarchical MAS setting**  
-  <p align="center"><img src="assets/main_table2.png" width="1000"></p>
-
-- **Table 3 — Main Results on Reasoning Intensive Tasks**
-  <p align="center"><img src="assets/main_table3.png" width="1000"></p>
-
-
-### ⚡ Superior Efficiency on **Time and Tokens**
-
-Overall, LatentMAS reduces:
-- **~50–80% tokens**
-- **~3×–7× wall-clock time**
-compared to standard Text-MAS or chain-of-thought baselines.
-
-
-## 🛠️ Getting Started
-
-This repository provides all code for reproducing LatentMAS, TextMAS, and baseline single-agent experiments across GSM8K, AIME24/25, GPQA, ARC-Easy/Challenge, MBPP+, HumanEval+, and MedQA.
-
-### ⚙️ Setup Environment Variables
-
-We recommend setting your HF cache directory to avoid repeated downloads:
-
-```bash
-export HF_HOME=/path/to/huggingface
-export TRANSFORMERS_CACHE=$HF_HOME
-export HF_DATASETS_CACHE=$HF_HOME
-````
-
-Models and datasets will automatically be downloaded into `$HF_HOME`.
-
-
-### 📦 Install Packages
-
-```bash
-conda create -n latentmas python=3.10 -y
-conda activate latentmas
-
-pip install -r requirements.txt
-```
-
-If you want **vLLM support**, also install:
-
-```bash
-pip install vllm
-```
-
-## 🚀 Quick Start
-
-### 1. Clone the repo
-
-```bash
-git clone https://github.com/Gen-Verse/LatentMAS.git
-cd LatentMAS
-```
-
-### 2. Repository Structure
+LatentMAS has agents pass their KV cache down a chain: a planner, a critic, a refiner and a judge, each waiting for the one before it, all working on the same question. That's dividing the *thinking*: different roles reasoning over shared information, one after another.
 
 ```
-LatentMAS/
-│── run.py                 # Main entry for experiments
-│── models.py              # Wrapper for HF + vLLM + latent realignment
-│── methods/
-│   ├── baseline.py        # Single-agent baseline
-│   ├── text_mas.py        # Token-space multi-agent method
-│   └── latent_mas.py      # Latent-space multi-agent (our method)
-│── prompts.py             # Prompt constructors
-│── data.py                # Dataset loaders
-│── data/                  # Provided data + figures (We give medqa.json as an example here)
-│── utils.py               # Answer parsing / timeout / helpers
-│── example_logs/          # Example logs from LatentMAS
-│── requirements.txt
+same question ─→ planner ─→ critic ─→ refiner ─→ judge → answer
+                 (one cache, handed down the chain)
 ```
 
+I wanted a truly parallel system that divides the *information* itself, map-reduce over the context:
 
-## 🧪 Running Experiments (standard HF backend)
-
-### 🔹 **Baseline (single model)**
-
-```bash
-python run.py --method baseline --model_name Qwen/Qwen3-14B --task gsm8k --max_samples -1
+```
+documents ─→ split ─→ worker 1 reads docs A ─┐
+                   ─→ worker 2 reads docs B ─┴─→ judge → answer
 ```
 
+That's what real systems need when:
 
-### 🔹 **TextMAS (text based multi-agent system)**
+- **the context is too big for one agent:** thousands of pages, a whole codebase, long logs;
+- **speed matters:** read N pieces in parallel instead of one long sequential read;
+- **the information is private by nature:** one agent per database, tool, or user, each seeing only its own.
 
-```bash
-python run.py --method text_mas --model_name Qwen/Qwen3-14B --task gsm8k --prompt sequential --max_samples -1
+It's also where latent communication gets hard. When everyone sees the same input, it doesn't matter that agents never look at each other's work. When the evidence is split, worker 2 never sees what worker 1 found, and a question that chains across both can break. This log is about that gap.
+
+## 1. Initial idea
+
+LatentMAS lets agents skip writing to each other. A transformer builds a KV cache as it reads, which is its working memory of the context, and LatentMAS hands that cache straight to the next agent instead of a text summary. Nothing gets flattened into natural language between agents.
+
+I thought: if the cache can be handed off, it can be **split**. A lead reads the context once, workers each take a different slice in parallel, and a judge reads all their caches together at once. It's map-reduce, with the KV cache as the channel.
+
+Built it as `routed_mas` ([`64d2d36`](https://github.com/JoshBong/LatentMAS/commit/64d2d36)):
+
+1. The lead reads the shared context → base cache `S0`.
+2. Each worker gets a copy of `S0` plus its own sub-task, and runs without seeing the others.
+3. Each worker's new tokens are sliced off and concatenated onto `S0`.
+4. The judge answers over `[S0 | worker 1 | worker 2 | ...]`.
+
+
+
+## 2. RoPE reindexing
+
+Every worker started right after `S0`, so all their tokens claimed the same positions. Stitched together naively, the judge read garbage.
+
+RoPE stores a key computed at position `p` as `R(p)·k`, and rotations compose (`R(Δ)·R(p) = R(p+Δ)`), so a cached key can be moved without re-running the model:
+
+```
+k' = k ⊙ cos(Δf) + rotate_half(k) ⊙ sin(Δf)        f = the model's rotary frequencies
 ```
 
+Each worker shifts by the total length of the workers before it ([`64d2d36`](https://github.com/JoshBong/LatentMAS/commit/64d2d36)). Surprisingly it worked and what I originally thought was going to be the main obstacle was solved relatively easily.
 
-### 🔹 **LatentMAS (our latent mas method)**
+## 3. Does stitching work
 
-```bash
-python run.py --method latent_mas --model_name Qwen/Qwen3-14B --task gsm8k --prompt sequential --max_samples -1
-```
+With positions fixed, there was still a deeper question. Each worker's cache was built blind to the others. How much does that cost, and could that be fixed without training or recomputing?
 
-#### Notes:
+I worked through it having two models, Claude and Gemini, research and discuss in parrellel. Each tried to break the other's position, and I oversaw and steered the conversation. Where it landed ([full write-up](docs/why-stitching-fails.md)): the loss has two parts.
 
-* **`--latent_steps`** ∈ [0, 80]
-  Tune for best performance.
-* **`--latent_space_realign`**
-  Enables latent→embedding alignment
-  We treat this as a **hyperparameter** — enable/disable depending on task/model:
+- **Calibration.** Blocks encoded in parallel give the judge a miscalibrated attention distribution. That part has a training-free fix: [APE](https://arxiv.org/abs/2502.05431) rescales attention at read time and recovers 93–98% of sequential performance on retrieval and in-context learning.
+- **Content.** If worker B would only have looked something up *because of* what worker A found, B never looked it up. "What was Y's revenue in the year X filed its first patent?" A finds the year; B, running blind, never pulls that year's revenue. No transform of B's cache can produce a number that was never computed.
 
-```bash
-python run.py --method latent_mas --model_name Qwen/Qwen3-14B --task gsm8k --prompt sequential --max_samples -1 --latent_space_realign
-```
+So stitching is sound only when **no worker's job depends on another worker's findings**. Comparisons ("which city is bigger?") qualify; chains don't. I tried having a 3B router check this before splitting the work, and it was at chance (3/6), wrong in both directions ([`c52acf4`](https://github.com/JoshBong/LatentMAS/commit/c52acf4)).
+
+## 4. No more stitching
+
+If merging caches back together is the part that breaks, keep the part that works and drop the rest. `routed_nl` ([`0be4da0`](https://github.com/JoshBong/LatentMAS/commit/0be4da0)):
+
+- An orchestrator writes one sub-task per worker.
+- The documents are encoded **once** into a shared KV prefix and handed to every worker as a view, with no copies.
+- All workers decode their findings in **one batched forward pass**, as short text.
+- The judge reads the findings, not every document.
+
+Every worker branches off the same read-only prefix, so nothing is ever merged. No cache surgery, no re-indexing, no stitching. This isn't a new idea: it's prefix caching, the same trick vLLM and SGLang use, studied for multi-agent workflows in [KVFlow](https://arxiv.org/abs/2507.07400) and for batched decoding in [Hydragen](https://arxiv.org/abs/2402.05099). What it changes relative to LatentMAS is the direction of sharing: the cache is shared on the way *in* (the documents), and results come back as text. The claim it can make is small and checkable: same accuracy as giving every worker the documents as text, with the documents paid for once instead of once per worker. `--channel` tests it with everything else fixed: `kv` (the mechanism), `text` (the cost control), `nodocs` (the kill switch: if `kv ≈ nodocs`, the shared prefix carries nothing).
+
+## 5. Similar work
+
+[KVShareArena](https://arxiv.org/abs/2609.10266) (Shi, Zheng, Lou) came out a week after `routed_nl`. It benchmarks KV-cache reuse across contexts, multi-agent workflows included, and finds that reusing a cache computed under different preceding text reduces answer quality, and that which repairs help depends on the model. It's a careful, large-scale version of what I ran into here, and it's the reference to read for this problem.
+
+## 6. The comparison results
+
+The clean comparison never got run after the scoring fix, so I ran it: HotpotQA (distractor), first 50 validation questions, seed 42, Qwen3-4B, 2 workers, one scorer for every arm. Each question needs facts from two paragraphs hidden among eight distractors.
 
 
-## 📘 Example Logs
+| arm                   | what it is                                                      | EM       | F1   | prompt tokens / question |
+| --------------------- | --------------------------------------------------------------- | -------- | ---- | ------------------------ |
+| `single`              | one model reads all 10 paragraphs                               | **0.64** | 0.73 | –                        |
+| `routed`              | parallel workers, caches stitched for the judge                 | 0.50     | 0.58 | –                        |
+| `routed`, text blocks | same, workers skip the latent thinking steps                    | 0.52     | 0.61 | –                        |
+| `empty_cache`         | kill switch: judge gets no worker blocks                        | 0.16     | 0.25 | –                        |
+| `nl_kv` (`routed_nl`) | documents shared once through the cache, workers report in text | **0.62** | 0.69 | **2,420**                |
+| `nl_text`             | same, documents pasted into every worker's prompt               | 0.62     | 0.70 | 4,022                    |
+| `nl_nodocs`           | kill switch: workers get no documents                           | 0.14     | 0.21 | –                        |
 
-Two example LatentMAS logs are provided for reference purposes:
 
-* `example_logs/qwen3_14b_mbppplus_sequential.txt`
-* `example_logs/qwen3_14b_humanevalplus_hierarchical.txt`
+What it says:
 
+- **Stitched caches carry real information** (0.50 vs. 0.16 with the worker blocks removed), **but lose to one model reading everything** (0.64). That's section 4 measured: on a chain question, the second worker never saw what the first one found.
+- **The latent thinking steps don't matter on Qwen3** (0.50 vs. 0.52). On Qwen2.5-3B they wrecked the judge's output entirely, which cost me a run before I caught it.
+- `routed_nl` **matches text delivery exactly** (0.62 vs. 0.62) **with 40% fewer prompt tokens**, and its kill switch drops to 0.14, so the shared cache is what's carrying the documents.
 
-Please refer to additional experiment logs [here](https://drive.google.com/drive/folders/1evGv5YAmLb4YM_D9Yu0ABa1nfqHC5N-l?usp=drive_link).
-You can open them to view the full agent interaction traces and outputs.
+n=50 with one seed is directional, not a benchmark result; the kill-switch gaps are large, the closer gaps aren't. Upstream `latent_mas` is left out of the table: its answers were mostly right but came as full sentences ("Yes, Scott Derrickson and Ed Wood were of the same nationality"), which strict exact match scores as wrong, so its number measures answer format, not the method.
 
+## 7. How I worked: an ADRS loop with a scientist in it
 
-## ⚡ vLLM Integration
+In a classical research loop one person does every stage: read, hypothesize, implement, run, analyze. Implementation is the bottleneck, so only a few ideas ever get tested.
 
-LatentMAS supports vLLM for faster inference.
+[ADRS](https://arxiv.org/abs/2512.14806) (AI-Driven Research for Systems; Cheng et al., following [Barbarians at the Gate](https://arxiv.org/abs/2510.06189)) turns research into a fast loop: AI **generates** candidate solutions, a verifier **evaluates** them, and the loop **refines**. The papers push toward automating the whole thing. I ran it with a scientist at both ends. I set the question and the hypothesis and decided what evidence would test it. AI agents surveyed the literature, implemented candidate methods, and stress-tested the reasoning. Code scored every method on equal terms against controls. Then I interpreted the evidence and set the next direction.
 
-### 🔹 Baseline with vLLM
+![ADRS loop with a scientist in it](assets/adrs-loop.png)
 
-```bash
-python run.py --method baseline --model_name Qwen/Qwen3-14B --task gsm8k --max_samples -1 --use_vllm
-```
+What that buys over the classical loop is breadth (many candidate methods and critiques per idea, not just the one there was time to build), speed (a turn of the loop takes days, so wrong directions die fast), and a different use of the scientist's time: less implementing, more designing experiments and interpreting results.
 
-### 🔹 TextMAS with vLLM
+## 8. What's next
 
-```bash
-python run.py --method text_mas --model_name Qwen/Qwen3-14B --task gsm8k --prompt sequential --max_samples -1 --use_vllm
-```
+The content loss is the real problem, and it can't be fixed after the fact: no transform of a blind cache adds information it never computed. Two ways forward:
 
-### 🔹 LatentMAS with vLLM
+**A trained translator instead of glued caches.** [RecursiveMAS](https://arxiv.org/abs/2604.25917) (the LatentMAS authors' follow-up) doesn't pass KV caches at all. A worker's hidden states go through a small trained adapter and get spliced into the receiver's prompt as input embeddings, so the receiver re-reads them from the first layer and builds the cross-worker attention itself. That's exactly what stitching can't do. The version I'd test here: workers stay parallel, their outputs come back as a few dozen latent slots in the judge's prompt instead of text findings, and the question is whether that beats `routed_nl`'s text at the same token budget, especially on chain questions where the workers depend on each other.
 
-LatentMAS supports a **hybrid HF + vLLM pipeline** for fast inference:
-- vLLM handles **final text generation** (with prefix caching, tensor parallelism, etc.)
-- A HuggingFace model handles **latent-space rollout** and hidden-state alignment
-
-For this setup, we recommend using two GPUs:
-- One GPU for vLLM (`--device`, e.g., `cuda:0`)
-- One GPU for the auxiliary HF model (`--device2`, e.g., `cuda:1`)
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 python run.py --method latent_mas --model_name Qwen/Qwen3-14B --task gsm8k --prompt sequential --max_samples -1 \
-  --use_vllm \
-  --use_second_HF_model \
-  --enable_prefix_caching \
-  --device2 cuda:1
-```
-
-**📍Important Note:**
-
-> vLLM does **not** officially support modifying KV-cache or prompting via latent embeddings.
-> We modify the partial inner package inside vLLM backend for our method implementation.
-> Note minor numeric differences may arise compared to offical HF backend due to different decoding (generation) strategies. Please Use the HF backend to reproduce the official published results.
-
-## 🎯 Advanced Features
-
-### 🔀 Understanding Prompting Modes: Sequential vs Hierarchical
-
-LatentMAS supports two distinct multi-agent collaboration patterns controlled by the `--prompt` flag:
-
-#### **Sequential Mode** (Workflow Pattern)
-
-Agents work in a **sequential workflow**, where each agent builds directly on the previous agent's work:
-
-```bash
-python run.py --method latent_mas --model_name Qwen/Qwen3-14B --task gsm8k --prompt sequential
-```
-
-**Example workflow for a research question:**
-
-1. **Planner Agent**: Creates a step-by-step plan
-   - Prompt: "Design a clear, step-by-step plan for how to solve the question"
-   - Output: A detailed plan (in latent space)
-
-2. **Critic Agent**: Reviews and critiques the plan
-   - Prompt: "Evaluate the correctness of the input plan and provide helpful feedback"
-   - Uses: The planner's output (via KV cache)
-   - Output: Feedback on the plan
-
-3. **Refiner Agent**: Improves the plan based on feedback
-   - Prompt: "Provide a refined step-by-step plan based on previous plan with feedback"
-   - Uses: Both planner + critic outputs
-   - Output: Refined plan
-
-4. **Judger Agent**: Produces final answer
-   - Prompt: "Solve the target question using latent information for reference"
-   - Uses: All previous agent outputs
-   - Output: Final detailed answer
-
-**Sequential Pattern:** `Build → Critique → Refine → Solve`
+**A search over the calibration half.** How the judge's attention reads stitched blocks (temperature, scaling, per-block weighting) is a short, parameter-free program, which suits an automated search step inside the loop above. That only works with a verifier I'd build myself first: hundreds of held-out questions, multiple seeds, and a synthetic recall task with unambiguous answers, because n=50 is noise and a search would select the noise.
 
 ---
 
-#### **Hierarchical Mode** (Parallel Perspectives)
 
-Agents approach the **same question from different perspectives** in parallel, then combine their insights:
+
+## Running it
 
 ```bash
-python run.py --method latent_mas --model_name Qwen/Qwen3-14B --task gsm8k --prompt hierarchical
+git clone -b routed-mas https://github.com/JoshBong/LatentMAS.git && cd LatentMAS
+pip install -r requirements.txt "transformers>=5" matplotlib   # results in section 7 used transformers 5
+
+# routed fan-out (2 entities -> 2 workers)
+python run.py --method routed_mas --model_name Qwen/Qwen3-4B --task hotpotqa --num_workers 2 --do_not_enforce_qwen
+
+# shared prefix + batched workers + text findings, and its two controls
+python run.py --method routed_nl --channel kv     --model_name Qwen/Qwen3-4B --task hotpotqa --do_not_enforce_qwen
+python run.py --method routed_nl --channel text   --model_name Qwen/Qwen3-4B --task hotpotqa --do_not_enforce_qwen
+python run.py --method routed_nl --channel nodocs --model_name Qwen/Qwen3-4B --task hotpotqa --do_not_enforce_qwen
+
+# the comparison in section 7 (resumable, one folder per arm)
+python experiments/run_suite.py --model Qwen/Qwen3-4B --tasks hotpotqa \
+    --arms single empty_cache routed nl_kv nl_text nl_nodocs --seeds 42 --max_samples 50 --num_workers 2 --out results/gate
+python experiments/analyze.py --out results/gate
+
+python -m pytest -q tests   # 49 tests: cache ops, RoPE re-index, batched prefix decode, scoring parity
 ```
 
-**Example workflow for the same research question:**
+`--method baseline` is one agent with full context; `--method latent_mas` is the upstream chain; `--no_reindex` turns off the position fix.
 
-1. **Planner (Math Agent)**: Solves from mathematical perspective
-   - Prompt: "You are a math agent. Reason step-by-step and put the final answer inside \boxed{}"
-   - Output: Mathematical analysis + answer
+## Credit
 
-2. **Critic (Science Agent)**: Solves from scientific perspective
-   - Prompt: "You are a science agent. Reason step-by-step and put the final answer inside \boxed{}"
-   - Output: Scientific analysis + answer
-
-3. **Refiner (Code Agent)**: Solves from computational perspective
-   - Prompt: "You are a code agent. Reason step-by-step and put the final answer inside \boxed{}"
-   - Output: Computational analysis + answer
-
-4. **Judger (Synthesizer)**: Combines all perspectives
-   - Prompt: "You are a task summarizer. Given responses from previous agents as reference..."
-   - Uses: All three parallel analyses
-   - Output: Synthesized final answer
-
-**Hierarchical Pattern:** `Multiple Parallel Perspectives → Synthesis`
+Fork of [LatentMAS](https://github.com/Gen-Verse/LatentMAS) — Zou et al., *Latent Collaboration in Multi-Agent Systems*, [arXiv:2511.20639](https://arxiv.org/abs/2511.20639). The routed methods, KV-cache operations, router, and experiment harness are this fork's additions.
 
 ---
 
-#### **Key Differences Summary**
-
-| Aspect | Sequential | Hierarchical |
-|--------|-----------|--------------|
-| **Agent roles** | Specialized workflow stages | Different domain experts |
-| **Information flow** | Linear chain (A→B→C→D) | Parallel then merge (A,B,C→D) |
-| **Each agent** | Performs different tasks | Solves same problem differently |
-| **Best for** | Complex planning/refinement | Multi-perspective analysis |
-| **Example use case** | Multi-step problem solving with feedback loops | Combining math, science, and code perspectives |
-
-#### **When to Use Each Mode**
-
-- **Use Sequential** when:
-  - You need iterative refinement (plan → critique → improve)
-  - The problem benefits from explicit feedback loops
-  - You want a clear workflow of distinct tasks
-
-- **Use Hierarchical** when:
-  - You want diverse perspectives on the same problem
-  - Different domain expertise adds value (math + science + code)
-  - You need to combine multiple reasoning approaches
-
-Both modes can be combined with custom prompts (via `--custom_prompt_file`) to define exactly how each agent behaves.
-
-### Custom Prompts
-
-LatentMAS supports fully customizable prompts via JSON configuration files. This allows you to tailor agent behavior for specific domains or tasks.
-
-#### Creating a Custom Prompt File
-
-Create a JSON file (e.g., `prompts.json`) with role-specific prompts:
-
-```json
-{
-  "system": "You are a helpful research assistant.",
-  "planner": "Draft a response to the question.\n\nQuestion:\n{question}",
-  "critic": "Review the prior answer critically. Give specific, actionable feedback.\n\nQuestion:\n{question}",
-  "refiner": "Produce an improved answer that incorporates the Critic's feedback.\n\nQuestion:\n{question}",
-  "judger": "Answer the question using prior context as hints. Provide a detailed response.\n\nQuestion:\n{question}",
-  "baseline": "You are a problem solver. Reason step by step.\n\nQuestion:\n{question}"
-}
-```
-
-**Supported placeholders:**
-- `{question}` - The input question
-- `{context}` - Previous agent outputs (for text_mas)
-
-**System message behavior:**
-- If `"system"` is provided and non-empty, it will be included in the message list
-- If `"system"` is empty (`""`) or omitted, no system message is added
-- Works across all methods: baseline, text_mas, and latent_mas
-
-#### Using Custom Prompts
-
-```bash
-# For LatentMAS with custom prompts
-python run.py --method latent_mas \
-  --model_name Qwen/Qwen3-14B \
-  --task custom \
-  --custom_question "What is the structure of spider silk?" \
-  --prompt hierarchical \
-  --custom_prompt_file prompts_advanced.json
-
-# For TextMAS with custom prompts
-python run.py --method text_mas \
-  --model_name Qwen/Qwen3-14B \
-  --task gsm8k \
-  --prompt sequential \
-  --custom_prompt_file prompts_advanced.json
-
-# For Baseline with custom prompts
-python run.py --method baseline \
-  --model_name Qwen/Qwen3-14B \
-  --task custom \
-  --custom_question "Explain photosynthesis." \
-  --custom_prompt_file prompts_advanced.json
-```
-
-### 🔧 Model-Specific Settings: Qwen Enforcement
-
-LatentMAS may work with any HuggingFace model without model-specific requirements (further testing is needed, especiallly for benchmark performance). To do this you need to turn off enforcing Qwen-specific behavior (system message and model name validation), use the `--do_not_enforce_qwen` flag:
-
-```bash
-# Works with any model
-python run.py --method latent_mas \
-  --model_name meta-llama/Llama-3.2-3B-Instruct \
-  --task gsm8k \
-  --prompt sequential --do_not_enforce_qwen
-
-```
-### Customizable Thinking Tokens
-
-Control the thinking prompt tokens that trigger reasoning mode in your model:
-
-```bash
-# Use default thinking tokens: <think>\n
-python run.py --method latent_mas \
-  --model_name Qwen/Qwen3-14B \
-  --task gsm8k \
-  --think
-
-# Use custom thinking tokens
-python run.py --method latent_mas \
-  --model_name Qwen/Qwen3-14B \
-  --task gsm8k \
-  --think "<reasoning>\n"
-
-# Use custom thinking tokens
-python run.py --method latent_mas \
-  --model_name Qwen/Qwen3-14B \
-  --task gsm8k \
-  --think "<think>\n<brainstorm>\n"
-
-# Use chain-of-thought style prompt
-python run.py --method latent_mas \
-  --model_name Qwen/Qwen3-14B \
-  --task gsm8k \
-  --think "Let's think step by step:\n"
-
-# No thinking tokens (omit flag)
-python run.py --method latent_mas \
-  --model_name Qwen/Qwen3-14B \
-  --task gsm8k
-```
-
-### Custom Agents and Agent Ordering
-
-You can define custom agents and their execution order in your `prompts.json` file. The **last agent in your list** always generates the final text output, regardless of its role name.
-
-**Define custom agents:**
-```json
-{
-  "agents": [
-    {"name": "Researcher", "role": "researcher"},
-    {"name": "Analyst", "role": "analyst"},
-    {"name": "Writer", "role": "writer"}
-  ],
-  "researcher": "Research the topic: {question}",
-  "analyst": "Analyze the research findings.",
-  "writer": "Write the final answer based on analysis."
-}
-```
-
-**Key features:**
-- **Flexible agent count**: Use 1, 2, 3, 4, 5+ agents
-- **Custom roles**: Name agents based on their actual function
-- **Last agent behavior**: The last agent in the list always produces decoded text output
-- **All other agents**: Generate latent representations (compressed reasoning)
-
-**Example with single agent:**
-```json
-{
-  "agents": [
-    {"name": "Expert", "role": "expert"}
-  ],
-  "expert": "Answer the question: {question}"
-}
-```
-
-**Example with 5 agents:**
-```json
-{
-  "agents": [
-    {"name": "Planner", "role": "planner"},
-    {"name": "Researcher", "role": "researcher"},
-    {"name": "Critic", "role": "critic"},
-    {"name": "Refiner", "role": "refiner"},
-    {"name": "Synthesizer", "role": "synthesizer"}
-  ]
-}
-```
-
-### Hybrid Text-Latent Generation
-
-The `--first_agent_text` flag enables the first agent to generate text instead of latent representations. This is particularly useful for:
-
-**1. Graph reasoning models**: Models trained to express graphs in natural language can output their structure as text, then subsequent agents reason over it efficiently in latent space.
-
-**2. Structured reasoning**: Models that benefit from explicitly generating intermediate structures (plans, outlines, decompositions) in text form before latent reasoning.
-
-**3. GRPO-trained models**: Models trained via Group Relative Policy Optimization to produce specific text patterns can maintain their learned behavior while benefiting from latent efficiency.
-
-```bash
-python run.py --method latent_mas \
-  --model_name Qwen/Qwen3-14B \
-  --task custom \
-  --custom_question "Design a molecular structure for a biodegradable plastic." \
-  --latent_steps 64 \
-  --first_agent_text \
-  --max_new_tokens 3000
-```
-
-**How it works:**
-- First agent generates explicit text output (e.g., graph structure, detailed plan)
-- Middle agents use latent-space reasoning (efficient, compressed thinking)
-- Last agent produces the final answer using all accumulated context
-
-**Technical notes:**
-- The first agent's generated text becomes part of the KV cache that subsequent agents attend to
-- Set `--max_new_tokens` appropriately for the first agent's output complexity
-- The `--latent_steps` parameter only affects middle agents (not first or last)
-- EOS tokens are preserved to maintain chat template structure
-
-### Complete Example: Research Question with Custom Setup
-
-Combining all advanced features for a research task:
-
-```bash
-python run.py --method latent_mas \
-  --model_name Qwen/Qwen3-14B \
-  --task custom \
-  --custom_question "Give me a research idea to make a composite inspired by spider silk." \
-  --custom_prompt_file prompts_advanced.json \
-  --prompt hierarchical \
-  --latent_steps 64 \
-  --think "<scientific_reasoning>\n" \
-  --first_agent_text \
-  --max_new_tokens 3000 \
-  --temperature 0.4
-```
-
-This setup:
-- Uses custom research-focused prompts from `prompts.json`
-- Runs on a custom scientific question
-- Uses hierarchical agent organization
-- Applies custom thinking tokens
-- First agent generates text for structured output
-- Remaining agents use latent reasoning with 64 steps
-
-### Complete Example: Sequential Workflow with Custom Agents
-
-For a sequential workflow (plan → critique → refine) using custom agents:
-
-```bash
-python run.py --method latent_mas \
-  --model_name Qwen/Qwen3-14B \
-  --task custom \
-  --custom_question "Give me a research idea to make a composite inspired by spider silk." \
-  --latent_steps 64 \
-  --prompt sequential \
-  --custom_prompt_file prompts_advanced.json \
-  --max_new_tokens 3000
-```
-
-**Example `prompts.json` file:**
-
-```json
-{
-  "agents": [
-    {"name": "Researcher", "role": "researcher"},
-    {"name": "Critic", "role": "critic"},
-    {"name": "Writer", "role": "writer"}
-  ],
-  "researcher": "Question:\n{question}\n\nBrainstorm and research the topic.",
-  "critic": "Question:\n{question}\n\nCritically review the research.",
-  "writer": "Question:\n{question}\n\nYou are provided with latent information for reference and a target question to solve.\n\nThe latent information might contain irrelevant contents. Ignore it if it is not helpful for solving the target question.\n\nWrite a final answer, very detailed, without outputting other irrelevant information."
-}
-```
-
-**Workflow:**
-1. **Researcher** → Brainstorms and researches (latent, 64 steps)
-2. **Critic** → Reviews the research (latent, 64 steps)
-3. **Writer** → Synthesizes into final answer (text output)
-
-**Key differences from hierarchical mode:**
-- Sequential builds chain of reasoning: Research → Critique → Write
-- Each agent has a distinct role in the workflow
-- Information flows linearly through agents
-- Best for iterative refinement tasks
-
-**Associated `prompts_advanced.json` file:**
-
-```json
-{
-  "agents": [
-    {"name": "Strategist", "role": "strategist"},
-    {"name": "Investigator", "role": "investigator"},
-    {"name": "Evaluator", "role": "evaluator"},
-    {"name": "Synthesizer", "role": "synthesizer"},
-    {"name": "Communicator", "role": "communicator"}
-  ],
-  "strategist": "Question:\n{question}\n\nYou are a strategic planning agent. Your task is to:\n1. Break down the question into key components\n2. Identify the core challenges and requirements\n3. Outline a high-level approach to address the question\n4. Highlight critical assumptions and constraints\n\nProvide a clear strategic framework for solving this problem.",
-  "investigator": "Question:\n{question}\n\nYou are a deep investigation agent. Building on the strategic framework, your task is to:\n1. Conduct thorough analysis of each component\n2. Explore multiple perspectives and approaches\n3. Identify relevant principles, methods, and precedents\n4. Uncover potential challenges and opportunities\n5. Generate detailed insights and findings\n\nProvide comprehensive investigative findings.",
-  "evaluator": "Question:\n{question}\n\nYou are a critical evaluation agent. Your task is to:\n1. Rigorously assess the strategic approach and investigative findings\n2. Identify logical flaws, gaps, or weaknesses\n3. Challenge assumptions and test robustness\n4. Propose improvements and alternative considerations\n5. Verify consistency and completeness\n\nProvide a thorough critical evaluation with specific recommendations for improvement.",
-  "synthesizer": "Question:\n{question}\n\nYou are a synthesis agent. Your task is to:\n1. Integrate the strategy, investigation, and evaluation into a coherent whole\n2. Resolve conflicts and reconcile different perspectives\n3. Strengthen weak points identified in the evaluation\n4. Construct a comprehensive solution or answer\n5. Ensure logical flow and completeness\n\nProvide an integrated, well-reasoned synthesis.",
-  "communicator": "Question:\n{question}\n\nYou are provided with latent information containing strategic planning, deep investigation, critical evaluation, and synthesis from previous agents.\n\nYour task is to:\n1. Extract the most valuable insights from the latent context\n2. Organize the information in a clear, logical structure\n3. Present a comprehensive, well-articulated final answer\n4. Ensure the response is precise, actionable, and complete\n5. Address the original question directly and thoroughly\n\nProvide a polished, professional final answer that leverages all prior analysis."
-}
-```
-
-## 🌐 Awesome Works based on LatentMAS
-
-1. KNN-LatentMAS: [Blog](https://bookmaster9.github.io/kNN-latentMAS/) and [Code](https://github.com/Bookmaster9/kNN-latentMAS).
-
-## 📚 Citation
-
-💫 If you find **LatentMAS** helpful, please kindly give us a star ⭐️ and cite below. Thanks!
-
-```
-@article{zou2025latentmas,
-  title={Latent Collaboration in Multi-Agent Systems},
-  author={Zou, Jiaru and Yang, Xiyuan and Qiu, Ruizhong and Li, Gaotang and Tieu, Katherine and Lu, Pan and Shen, Ke and Tong, Hanghang and Choi, Yejin and He, Jingrui and Zou, James and Wang, Mengdi and Yang, Ling},
-  journal={arXiv preprint arXiv:2511.20639},
-  year={2025}
-}
-```
-
-## 🤝 Ackowledgement 
-
-This code is partially based on the amazing work of [vLLM](https://github.com/vllm-project/vllm).
-
-This code is based on the amazing [LatentMAS](https://github.com/Gen-Verse/LatentMAS) repo, adapted here for flexible use cases in scientific and technical applications.
+Research log, Jul–Oct 2026. Full dated commit history available on request.
