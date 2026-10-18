@@ -1,6 +1,6 @@
 # Why stitching worker caches fails
 
-Notes from working out what `routed_mas` loses when it concatenates independently computed worker caches (Jul 30 – Aug 2026). I worked through it as an adversarial back-and-forth between two models, Claude and Gemini, each trying to break the other's position, with me refereeing. This page keeps the conclusions and sources and drops the dialogue.
+Notes from working out what `routed_mas` loses when it concatenates independently computed worker caches (Jul 30 – Aug 2026). This page keeps the conclusions and sources.
 
 ## The setup
 
